@@ -21,6 +21,8 @@ import logging
 import asyncio
 import re
 import string
+import time
+import urllib.request
 from datetime import timedelta
 from dotenv import load_dotenv
 load_dotenv()  # loads variables from a local .env file, if one exists (see .env.example)
@@ -48,6 +50,54 @@ CLINICAL_VOCAB_HINT = (
     "milligrams, prescribe, diagnosis, symptoms, follow-up, referral, "
     "allergies, medication, dosage."
 )
+
+
+
+_livekit_check: dict = {"ts": 0.0, "ok": None}
+
+
+def _livekit_reachable(max_age: float = 60.0) -> bool:
+    """Verify the LIVEKIT_* credentials actually authenticate with LiveKit Cloud.
+
+    Checking that the env vars are present (like `livekit_configured`) isn't enough —
+    a revoked or mistyped key still "looks configured" while every connection fails.
+    We call the RoomService API once per `max_age` seconds and cache the result so
+    `/api/status` and `/api/livekit-token` tell the truth without stalling on every
+    poll with a network round-trip.
+    """
+    now = time.time()
+    if _livekit_check["ok"] is not None and now - _livekit_check["ts"] < max_age:
+        return _livekit_check["ok"]
+
+    ok = False
+    url = os.environ.get("LIVEKIT_URL")
+    api_key = os.environ.get("LIVEKIT_API_KEY")
+    api_secret = os.environ.get("LIVEKIT_API_SECRET")
+    http_host = url.replace("wss://", "https://").replace("ws://", "http://") if url else ""
+    if http_host and api_key and api_secret:
+        try:
+            from livekit import api
+
+            token = (
+                api.AccessToken(api_key, api_secret)
+                .with_identity("scribe-status-check")
+                .with_grants(api.VideoGrants(room_join=True, room="scribe-status-check"))
+                .to_jwt()
+            )
+            request = urllib.request.Request(
+                http_host + "/twirp/livekit.RoomService/ListRooms",
+                data=b"{}",
+                headers={"Content-Type": "application/json", "Authorization": "Bearer " + token},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                ok = response.status == 200
+        except Exception:
+            logger.info("LiveKit reachability check failed (using direct-audio transport)", exc_info=True)
+            ok = False
+
+    _livekit_check.update(ts=now, ok=ok)
+    return ok
 
 
 def _normalize_for_dedup(text: str) -> str:
@@ -116,6 +166,9 @@ def status():
         "llm_configured": anthropic_configured or openrouter_configured,
         "llm_provider": "anthropic" if anthropic_configured else ("openrouter" if openrouter_configured else None),
         "livekit_configured": livekit_configured,
+        # Presence of env vars is NOT the same as working credentials — verify once a
+        # minute so the UI chip tells the truth (the old key returned 401).
+        "livekit_verified": _livekit_reachable(),
     }
 
 
@@ -129,6 +182,15 @@ def livekit_token():
         return Response(
             status_code=503,
             content=json.dumps({"error": "LiveKit is not configured"}),
+            media_type="application/json",
+        )
+    if not _livekit_reachable():
+        return Response(
+            status_code=503,
+            content=json.dumps({
+                "error": "LiveKit credentials are invalid or revoked (authentication failed). "
+                "Audio still streams directly to the local Whisper model without LiveKit."
+            }),
             media_type="application/json",
         )
     assert livekit_url and api_key and api_secret
@@ -244,6 +306,93 @@ class LiveSession:
         return "\n".join(self.transcript_lines)
 
 
+
+
+
+def _split_sentences(text: str):
+    """Split Whisper output into complete sentences plus a possibly-incomplete tail.
+
+    "Complete" means ending in a sentence terminator (. ! ?). Whatever trails the last
+    terminator is held back as a pending tail because it may still change once more
+    audio arrives — emitting it early is what caused near-duplicate, slightly-different
+    lines to pile up in the transcript.
+    """
+    complete_sentences = [s.strip() for s in re.findall(r"[^.!?]+[.!?]+", text) if s.strip()]
+    last_terminator_end = 0
+    for m in re.finditer(r"[.!?]+", text):
+        last_terminator_end = m.end()
+    tail = text[last_terminator_end:].strip()
+
+    # Whisper doesn't always add terminal punctuation, especially for short/casual
+    # utterances — if we held every unpunctuated fragment back forever, the transcript
+    # (and the pipeline status indicator) would look permanently "stuck" even though
+    # transcription is working fine. Once a trailing fragment is long enough (8+ words)
+    # it's very unlikely to still be "in progress", so treat it as complete instead of
+    # waiting on punctuation that may never come.
+    if tail and len(tail.split()) >= 8:
+        complete_sentences.append(tail)
+        tail = ""
+    return complete_sentences, tail
+
+
+async def _transcribe_and_emit(session, websocket, wav_blob) -> str:
+    """Run one Whisper pass over `wav_blob` and push per-sentence transcript lines
+    plus a refreshed SOAP note to the client.
+
+    Shared by the direct-WebSocket audio path and the (optional) LiveKit bridge path
+    so both transports produce identical, duplicate-free output — sentence splitting,
+    dedup and speaker inference all live here rather than in each transport separately.
+    """
+    from .transcription import transcribe_audio_bytes
+
+    await websocket.send_json({"type": "transcribing"})
+    recent_context = " ".join(session.transcript_lines[-3:])
+    text = await asyncio.to_thread(
+        transcribe_audio_bytes,
+        wav_blob,
+        prompt=f"{CLINICAL_VOCAB_HINT} Clinical consultation. {recent_context}"[-1000:],
+    )
+    if not text:
+        # No speech in this window — keep any in-progress tail intact and just
+        # refresh the note so the pipeline indicator doesn't sit on "Transcribe"
+        # forever during silent stretches.
+        note = generate_soap(session.full_transcript, use_llm=False)
+        await websocket.send_json({"type": "note_update", "note": note})
+        return ""
+
+    from .soap_generator import _infer_speaker
+
+    complete_sentences, tail = _split_sentences(text)
+    session.pending_tail = tail
+
+    for sentence in complete_sentences:
+        key = _normalize_for_dedup(sentence)
+        if not key or key in session.emitted_keys:
+            continue
+        session.emitted_keys.add(key)
+        inferred_speaker = _infer_speaker(sentence)
+        if inferred_speaker:
+            session.last_speaker = inferred_speaker
+        # Preserve the previous role for fragments such as "and it gets worse"
+        # instead of randomly changing speakers.
+        speaker = (session.last_speaker or "patient").capitalize()
+        line = f"{speaker}: {sentence}"
+        session.transcript_lines.append(line)
+        await websocket.send_json({
+            "type": "transcript_update",
+            "line": line,
+            "line_index": len(session.transcript_lines) - 1,
+            "full_transcript": session.full_transcript,
+        })
+
+    # Always refresh the note after any non-empty transcription pass — even if this
+    # particular window didn't yield a brand-new sentence, so the pipeline indicator
+    # doesn't look stuck on "Capture" during long unpunctuated stretches.
+    note = generate_soap(session.full_transcript, use_llm=False)
+    await websocket.send_json({"type": "note_update", "note": note})
+    return text
+
+
 @app.websocket("/ws/session")
 async def live_session(websocket: WebSocket):
     await websocket.accept()
@@ -252,10 +401,11 @@ async def live_session(websocket: WebSocket):
     await websocket.send_json({"type": "session_started", "session_id": session.session_id})
 
     async def handle_livekit_audio(audio_bytes: bytes):
-        """Adapt LiveKit's PCM chunks to the existing Whisper session logic."""
+        """Adapt LiveKit's WAV chunks to the same sentence-splitting Whisper
+        pipeline used by direct streaming, so both transports produce the same
+        duplicate-free per-sentence transcript."""
         try:
             from .transcription import (
-                transcribe_audio_bytes,
                 is_silent_wav,
                 extract_pcm_from_wav,
                 wav_bytes_from_pcm,
@@ -263,6 +413,7 @@ async def live_session(websocket: WebSocket):
 
             if is_silent_wav(audio_bytes) or session.transcribing:
                 return
+
             pcm, sample_rate, sample_width, channels = extract_pcm_from_wav(audio_bytes)
             session.sample_rate = sample_rate
             session.sample_width = sample_width
@@ -273,48 +424,21 @@ async def live_session(websocket: WebSocket):
                 del session.audio_buffer[: len(session.audio_buffer) - max_bytes]
 
             session.transcribing = True
-            await websocket.send_json({"type": "transcribing"})
-            wav_blob = wav_bytes_from_pcm(
-                bytes(session.audio_buffer), sample_rate, sample_width, channels
-            )
-            recent_context = " ".join(session.transcript_lines[-3:])
-            text = await asyncio.to_thread(
-                transcribe_audio_bytes,
-                wav_blob,
-                prompt=f"{CLINICAL_VOCAB_HINT} Clinical consultation. {recent_context}"[-1000:],
-            )
-            if not text:
-                return
-
-            from .soap_generator import _infer_speaker
-
-            key = _normalize_for_dedup(text)
-            if key and key not in session.emitted_keys:
-                session.emitted_keys.add(key)
-                inferred_speaker = _infer_speaker(text)
-                if inferred_speaker:
-                    session.last_speaker = inferred_speaker
-                speaker = (session.last_speaker or "patient").capitalize()
-                line = f"{speaker}: {text}"
-                session.transcript_lines.append(line)
-                await websocket.send_json({
-                    "type": "transcript_update",
-                    "line": line,
-                    "line_index": len(session.transcript_lines) - 1,
-                    "full_transcript": session.full_transcript,
-                })
-            await websocket.send_json({
-                "type": "note_update",
-                "note": generate_soap(session.full_transcript, use_llm=False),
-            })
+            try:
+                wav_blob = wav_bytes_from_pcm(
+                    bytes(session.audio_buffer), sample_rate, sample_width, channels
+                )
+                await _transcribe_and_emit(session, websocket, wav_blob)
+            finally:
+                session.transcribing = False
+        except WebSocketDisconnect:
+            raise
         except Exception as error:
             logger.exception("LiveKit audio transcription failed")
             try:
                 await websocket.send_json({"type": "error", "message": str(error)})
             except WebSocketDisconnect:
                 pass
-        finally:
-            session.transcribing = False
 
     try:
         while True:
@@ -327,7 +451,6 @@ async def live_session(websocket: WebSocket):
                 # Audio chunk arrived — accumulate it and transcribe a longer window
                 try:
                     from .transcription import (
-                        transcribe_audio_bytes,
                         is_silent_wav,
                         extract_pcm_from_wav,
                         wav_bytes_from_pcm,
@@ -373,80 +496,15 @@ async def live_session(websocket: WebSocket):
                     if session.transcribing:
                         continue
                     session.transcribing = True
-
-                    # Re-wrap the accumulated PCM into ONE valid WAV file right
-                    # before transcribing — never buffer whole WAV files.
-                    wav_blob = wav_bytes_from_pcm(
-                        bytes(session.audio_buffer), sample_rate, sample_width, channels
-                    )
-
-                    recent_context = " ".join(session.transcript_lines[-3:])
-                    await websocket.send_json({"type": "transcribing"})
                     try:
-                        text = await asyncio.to_thread(
-                            transcribe_audio_bytes,
-                            wav_blob,
-                            prompt=f"{CLINICAL_VOCAB_HINT} Clinical consultation. {recent_context}"[-1000:],
+                        # Re-wrap the accumulated PCM into ONE valid WAV file right
+                        # before transcribing — never buffer whole WAV files.
+                        wav_blob = wav_bytes_from_pcm(
+                            bytes(session.audio_buffer), sample_rate, sample_width, channels
                         )
-                        if not text:
-                            continue
-
-                        from .soap_generator import _infer_speaker
-
-                        # Only treat text ending in . ! or ? as a "complete" sentence
-                        # worth emitting. Whatever trails the last terminator is kept
-                        # as pending_tail instead of being emitted immediately — it
-                        # may still change once more audio arrives, and emitting it
-                        # early is what caused near-duplicate, slightly-different
-                        # lines to pile up in the transcript.
-                        complete_sentences = [s.strip() for s in re.findall(r"[^.!?]+[.!?]+", text) if s.strip()]
-                        last_terminator_end = 0
-                        for m in re.finditer(r"[.!?]+", text):
-                            last_terminator_end = m.end()
-                        tail = text[last_terminator_end:].strip()
-
-                        # Whisper doesn't always add terminal punctuation, especially
-                        # for short/casual utterances — if we held every unpunctuated
-                        # fragment back forever, the transcript (and the pipeline
-                        # status indicator) would look permanently "stuck" even
-                        # though transcription is working fine. Once a trailing
-                        # fragment is long enough (8+ words) it's very unlikely to
-                        # still be "in progress", so treat it as complete instead of
-                        # waiting on punctuation that may never come.
-                        if tail and len(tail.split()) >= 8:
-                            complete_sentences.append(tail)
-                            tail = ""
-
-                        session.pending_tail = tail
-
-                        for sentence in complete_sentences:
-                            key = _normalize_for_dedup(sentence)
-                            if not key or key in session.emitted_keys:
-                                continue
-                            session.emitted_keys.add(key)
-                            inferred_speaker = _infer_speaker(sentence)
-                            if inferred_speaker:
-                                session.last_speaker = inferred_speaker
-                            # Preserve the previous role for fragments such as "and it
-                            # gets worse" instead of randomly changing speakers.
-                            speaker = (session.last_speaker or "patient").capitalize()
-                            line = f"{speaker}: {sentence}"
-                            session.transcript_lines.append(line)
-                            await websocket.send_json({
-                                "type": "transcript_update",
-                                "line": line,
-                                "line_index": len(session.transcript_lines) - 1,
-                                "full_transcript": session.full_transcript,
-                            })
-
-                        # Always refresh the note and advance the pipeline status
-                        # after any non-empty transcription pass — even if this
-                        # particular window didn't yield a brand-new sentence. If we
-                        # only did this when new sentences appeared, a stretch of
-                        # unpunctuated or still-forming speech would leave the
-                        # pipeline indicator visibly stuck on "Capture".
-                        note = generate_soap(session.full_transcript, use_llm=False)
-                        await websocket.send_json({"type": "note_update", "note": note})
+                        # Shared pass: sentence split + dedup + speaker inference +
+                        # SOAP refresh, identical to what the LiveKit path uses.
+                        await _transcribe_and_emit(session, websocket, wav_blob)
                     finally:
                         # Always release the guard, even on an early 'continue'
                         # above or an exception below — otherwise one failed

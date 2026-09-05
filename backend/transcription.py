@@ -76,10 +76,20 @@ def transcribe_audio_bytes(
             # first-word or last-word transcription errors.
             "speech_pad_ms": 200,
         },
-        condition_on_previous_text=True,
+        # IMPORTANT: conditioning on previous text is a known Whisper *hallucination*
+        # trigger — once it emits a plausible-but-wrong phrase ("I can't hold it...",
+        # "Thank you..."), that same text conditions the next pass and can repeat or
+        # chain. This backend transcribes short rolling windows and already carries its
+        # own context via `initial_prompt`, so disabling conditioning removes the loop
+        # without losing accuracy. See https://github.com/openai/whisper/discussions/1133
+        condition_on_previous_text=False,
+        without_timestamps=True,
         initial_prompt=prompt or "Clinical consultation between a doctor and patient.",
         temperature=0.0,
-        no_speech_threshold=0.45,
+        # Lower than the faster-whisper default so segments that are probably NOT
+        # speech (keyboard click, chair squeak, a short cough) get dropped instead of
+        # being turned into hallucinated dialogue.
+        no_speech_threshold=0.4,
         compression_ratio_threshold=2.4,
         log_prob_threshold=-1.0,
     )
