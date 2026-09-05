@@ -1,0 +1,41 @@
+# --- Secrets — never commit real API keys ---
+.env
+*.env
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.python-version
+
+# --- This project's runtime data ---
+backend/sessions.db
+
+# --- ML model caches (Whisper downloads these on first run) ---
+.cache/
+*.pt
+*.bin
+*.onnx
+
+# --- OS clutter ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Editor/IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Node (only relevant if you ever add a JS build step) ---
+node_modules/
+
+# --- Misc ---
+*.log
+*.tmp
