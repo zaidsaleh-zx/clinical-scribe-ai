@@ -250,6 +250,11 @@ you want Claude-assisted notes; rule-based notes work without either key. The
 default SQLite session history is local to the running service and may reset when
 the host redeploys or restarts.
 
+Vercel deployment is also supported for the HTTP/FastAPI routes through
+`api/index.py`. Vercel's serverless runtime does not provide the persistent
+WebSocket process required by Live Audio, so use the Render service for the full
+LiveKit and Whisper workflow.
+
 ### Install
 ```bash
 pip install -r requirements.txt
