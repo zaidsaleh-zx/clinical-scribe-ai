@@ -35,14 +35,14 @@ async function loadStatus() {
     const livekitChip = document.getElementById("chipLiveKit");
     whisperChip.classList.add(data.whisper_installed ? "on" : "off");
     llmChip.classList.add(data.llm_configured ? "on" : "off");
-    livekitChip.classList.add(data.livekit_configured ? "on" : "off");
+    livekitChip.classList.add(data.livekit_verified ? "on" : "off");
     whisperChip.title = data.whisper_installed ? "Whisper installed" : "Whisper not installed — Live Audio mode unavailable";
     llmChip.title = data.llm_configured
       ? `Configured via ${data.llm_provider === "openrouter" ? "OpenRouter" : "Anthropic API"}`
       : "No API key — using rule-based fallback";
-    livekitChip.title = data.livekit_configured
-      ? "LiveKit audio transport configured"
-      : "LiveKit not configured — add credentials to backend/.env";
+    livekitChip.title = data.livekit_verified
+      ? "LiveKit transport verified"
+      : "LiveKit not configured/verified — audio streams directly to the local Whisper model (no cloud needed)";
   } catch (err) {
     console.error("Status check failed:", err);
   }
@@ -533,6 +533,10 @@ async function loadSessionById(id) {
 document.getElementById("refreshHistoryBtn").addEventListener("click", loadHistory);
 
 // ================= LIVE AUDIO MODE =================
+// Live Audio streams the microphone DIRECTLY to this backend over the WebSocket as
+// 16-bit PCM WAV chunks, where the local faster-whisper model transcribes them.
+// No external/cloud transport is required — voice-to-text works as long as the
+// backend is reachable and the Whisper model is downloaded.
 const recordBtn = document.getElementById("recordBtn");
 const resetSessionBtn = document.getElementById("resetSessionBtn");
 const recordTimerEl = document.getElementById("recordTimer");
@@ -543,8 +547,15 @@ let mediaStream = null;
 let isRecording = false;
 let recordSeconds = 0;
 let timerInterval = null;
-let livekitRoom = null;
-let livekitTrack = null;
+let audioContext = null;
+let sourceNode = null;
+let processorNode = null;
+let pcmBuffer = [];
+let audioSendTimer = null;
+let captureSampleRate = 16000;
+
+// How often buffered PCM is packaged into a WAV and pushed to the backend.
+const AUDIO_CHUNK_MS = 2500;
 
 function connectWebSocket() {
   const backendUrl = API_BASE || window.location.origin;
@@ -581,33 +592,112 @@ function connectWebSocket() {
   });
 }
 
-async function startLiveKitAudio() {
-  if (!mediaStream || !ws || ws.readyState !== WebSocket.OPEN) return;
-  const tokenResponse = await fetch(`${API_BASE}/api/livekit-token`);
-  const config = await tokenResponse.json();
-  if (!tokenResponse.ok) throw new Error(config.error || "LiveKit is not configured.");
-  if (!window.LivekitClient) throw new Error("LiveKit client failed to load.");
+// Package raw float PCM samples into a standard 16-bit mono WAV file.
+// The sample rate is read back from the actual AudioContext so this works even
+// if the browser overrode our 16 kHz request (the backend trusts the header).
+function audioSamplesToWav(samples, sampleRate) {
+  const numFrames = samples.length;
+  const buffer = new ArrayBuffer(44 + numFrames * 2);
+  const view = new DataView(buffer);
 
-  livekitRoom = new window.LivekitClient.Room();
-  await livekitRoom.connect(config.url, config.token);
-  ws.send(JSON.stringify({ type: "livekit_start", room: config.room }));
+  const writeString = (offset, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
 
-  const audioTrack = mediaStream.getAudioTracks()[0];
-  livekitTrack = new window.LivekitClient.LocalAudioTrack(audioTrack);
-  await livekitRoom.localParticipant.publishTrack(livekitTrack);
-  setPipelineStep("capture");
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + numFrames * 2, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);                       // fmt chunk size
+  view.setUint16(20, 1, true);                        // PCM format
+  view.setUint16(22, 1, true);                        // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);           // byte rate
+  view.setUint16(32, 2, true);                        // block align
+  view.setUint16(34, 16, true);                       // bits per sample
+  writeString(36, "data");
+  view.setUint32(40, numFrames * 2, true);
+
+  let offset = 44;
+  for (let i = 0; i < numFrames; i++, offset += 2) {
+    let s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buffer], { type: "audio/wav" });
 }
 
-async function stopLiveKitAudio() {
-  if (livekitRoom && livekitTrack) {
-    await livekitRoom.localParticipant.unpublishTrack(livekitTrack);
-    livekitTrack.stop();
+function flushAudioToBackend(force = false) {
+  // Don't bother the backend with sub-100ms slivers during live capture.
+  if (!force && pcmBuffer.length < 1600) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN || pcmBuffer.length === 0) {
+    pcmBuffer.length = 0;
+    return;
   }
-  if (livekitRoom) livekitRoom.disconnect();
-  livekitTrack = null;
-  livekitRoom = null;
-  if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
-  mediaStream = null;
+  const samples = new Float32Array(pcmBuffer);
+  pcmBuffer.length = 0;
+  ws.send(audioSamplesToWav(samples, captureSampleRate));
+}
+
+async function startDirectAudio() {
+  // 16 kHz is our preference (smaller chunks); some browsers ignore the hint,
+  // in which case the real sampleRate is written into the WAV header anyway.
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  try {
+    audioContext = new AudioCtx({ sampleRate: 16000 });
+  } catch (err) {
+    audioContext = new AudioCtx();
+  }
+  captureSampleRate = audioContext.sampleRate || 16000;
+
+  sourceNode = audioContext.createMediaStreamSource(mediaStream);
+
+  // ScriptProcessor is deprecated but works in every browser, including Safari,
+  // and needs no separate worklet file (important when served over http).
+  processorNode = audioContext.createScriptProcessor(4096, 1, 1);
+  processorNode.onaudioprocess = (event) => {
+    // Tab capture can be multi-channel; each Float32 sample here is already
+    // downmixed by the browser for the mono input buffer.
+    const input = event.inputBuffer.getChannelData(0);
+    for (let i = 0; i < input.length; i++) pcmBuffer.push(input[i]);
+  };
+  sourceNode.connect(processorNode);
+
+  // Connect the processor to a zero-gain node (instead of the destination) so
+  // it keeps firing in all browsers without feeding the mic back into speakers.
+  const silentBus = audioContext.createGain();
+  silentBus.gain.value = 0;
+  processorNode.connect(silentBus);
+  silentBus.connect(audioContext.destination);
+
+  // Stream buffered audio to the backend on a fixed cadence so the transcript
+  // and SOAP note update live while the user is speaking.
+  audioSendTimer = setInterval(() => flushAudioToBackend(false), AUDIO_CHUNK_MS);
+}
+
+function stopDirectAudio() {
+  if (audioSendTimer) {
+    clearInterval(audioSendTimer);
+    audioSendTimer = null;
+  }
+  if (processorNode) {
+    try { processorNode.disconnect(); } catch (err) { /* noop */ }
+    processorNode = null;
+  }
+  if (sourceNode) {
+    try { sourceNode.disconnect(); } catch (err) { /* noop */ }
+    sourceNode = null;
+  }
+  if (audioContext) {
+    audioContext.close().catch(() => {});
+    audioContext = null;
+  }
+  // Send whatever was captured but not yet flushed (e.g. a short utterance).
+  flushAudioToBackend(true);
+  pcmBuffer = [];
+  if (mediaStream) {
+    mediaStream.getTracks().forEach(track => track.stop());
+    mediaStream = null;
+  }
 }
 
 recordBtn.addEventListener("click", async () => {
@@ -627,18 +717,21 @@ recordBtn.addEventListener("click", async () => {
         }
         mediaStream.getVideoTracks().forEach(track => { track.onended = () => { if (isRecording) recordBtn.click(); }; });
       } else {
+        // Good audio defaults for speech recognition: keep echo cancellation and
+        // noise suppression ON so Whisper gets clean speech instead of room echo.
         mediaStream = await navigator.mediaDevices.getUserMedia({
           audio: {
             channelCount: 1,
-            echoCancellation: false,
+            echoCancellation: true,
             noiseSuppression: true,
             autoGainControl: true,
           },
         });
       }
       if (!ws || ws.readyState !== WebSocket.OPEN) await connectWebSocket();
+      await startDirectAudio();
       isRecording = true;
-      await startLiveKitAudio();
+      setPipelineStep("capture");
 
       recordSeconds = 0;
       timerInterval = setInterval(() => {
@@ -650,20 +743,23 @@ recordBtn.addEventListener("click", async () => {
 
       recordBtn.classList.add("recording");
       recordBtn.innerHTML = `<span class="rec-dot"></span> Stop Recording`;
-      setPipelineStep("capture");
     } catch (err) {
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+      }
       alert("Microphone access denied or unavailable: " + err.message);
     }
   } else {
     isRecording = false;
-    await stopLiveKitAudio();
     clearInterval(timerInterval);
+    timerInterval = null;
+    stopDirectAudio();
     if (ws && ws.readyState === WebSocket.OPEN) {
       setPipelineStep("analyze");
-      ws.send(JSON.stringify({ type: "livekit_stop" }));
-      setTimeout(() => {
-        if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "finalize" }));
-      }, 500);
+      // finalize: flush the last sentence fragment held back for punctuation and
+      // run the LLM-structured note once at the end for a cleaner final SOAP draft.
+      ws.send(JSON.stringify({ type: "finalize" }));
     }
     recordBtn.classList.remove("recording");
     recordBtn.innerHTML = `<span class="rec-dot"></span> Start Recording`;
