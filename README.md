@@ -217,15 +217,18 @@ The launcher uses `.venv\Scripts\python.exe` automatically when that environment
 exists. This is important for Live Audio mode because the Whisper dependency must be
 installed in the same Python environment that starts Uvicorn.
 
-Live Audio uses LiveKit Cloud for browser audio transport. The backend issues a
-short-lived browser token from `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and
-`LIVEKIT_API_SECRET`, then subscribes to the room audio and sends PCM chunks to
-local `faster-whisper`. Copy `backend/.env.example` to `backend/.env`, enter a
-newly generated LiveKit key and secret, and restart the backend. Never expose the
-secret in frontend code.
+Live Audio streams the mic **directly to the backend over the WebSocket** as 16-bit PCM
+WAV chunks; the local `faster-whisper` model transcribes them, so it works with **no
+external cloud account** (just the local server plus a one-time model download). There is
+**no LiveKit requirement anymore** — the previous LiveKit Cloud transport is still supported
+on the backend as an optional extra (`LIVEKIT_URL`, `LIVEKIT_API_KEY`,
+`LIVEKIT_API_SECRET` in `backend/.env`, plus the `/api/livekit-token` endpoint), but Live
+Audio works fully without it. For best recognition, allow **mic permission** in the browser
+and keep `echoCancellation`/`noiseSuppression` on (already the defaults in the app).
 
-The credentials in the supplied screenshot were exposed and must be revoked;
-generate replacement credentials before testing this integration.
+The backend's `/api/status` endpoint now *verifies* any LiveKit credentials live
+(`livekit_verified`) instead of trusting that env-var presence means they work — a revoked
+key (like the old one, which returned 401) stops being reported as configured.
 
 ### Open it on a phone
 
@@ -253,7 +256,7 @@ the host redeploys or restarts.
 Vercel deployment is also supported for the HTTP/FastAPI routes through
 `api/index.py`. Vercel's serverless runtime does not provide the persistent
 WebSocket process required by Live Audio, so use the Render service for the full
-LiveKit and Whisper workflow.
+live Whisper workflow.
 
 ### Install
 ```bash
