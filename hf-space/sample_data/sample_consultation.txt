@@ -1,0 +1,14 @@
+Doctor: Good morning, what brings you in today?
+Patient: Hi doctor, I've been having this headache for about three days now, and it's getting worse.
+Patient: I also feel a bit dizzy when I stand up too quickly.
+Doctor: Okay, and have you noticed any fever or nausea along with the headache?
+Patient: Yeah, I felt a bit nauseous yesterday, and I think I had a slight fever last night.
+Doctor: Let me check your vitals. Your blood pressure is 128/82, temperature is 100.4 F, heart rate is 88 bpm.
+Doctor: On examination, your throat looks slightly red but your lungs are clear.
+Patient: I've also been really tired the past few days, hard to focus at work.
+Doctor: Based on what you're describing, it looks like a viral infection, possibly early flu, consistent with the mild fever and fatigue.
+Doctor: I'll prescribe paracetamol 500mg every 6 hours for the fever and headache.
+Doctor: Make sure to rest and stay hydrated, avoid strenuous activity for the next few days.
+Doctor: If the fever goes above 102 or the headache gets significantly worse, come back immediately.
+Doctor: Otherwise, let's follow up in one week if things haven't improved.
+Patient: Okay, thank you doctor.
