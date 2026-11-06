@@ -24,6 +24,7 @@ note is meant to be reviewed and edited by the clinician before it goes in a rea
 import os
 import re
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -667,6 +668,20 @@ def _call_openrouter(transcript: str, api_key: str) -> SoapNote:
     raise last_error or ValueError("All OpenRouter model candidates failed")
 
 
+def _call_with_retry(func, *args, retries: int = 2, base_delay: float = 0.6, **kwargs):
+    """Retry transient API failures without making the app fail hard on a single blip."""
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:  # pragma: no cover - exercised via provider API calls
+            last_error = exc
+            if attempt >= retries:
+                raise
+            delay = base_delay * (2 ** attempt)
+            time.sleep(delay)
+    raise last_error
+
 def generate_soap_llm(transcript: str, api_key: str = None):
     """
     LLM-assisted SOAP generation. Supports two providers, checked in this order:
@@ -682,13 +697,13 @@ def generate_soap_llm(transcript: str, api_key: str = None):
 
     if anthropic_key:
         try:
-            return _call_anthropic_direct(transcript, anthropic_key), "llm_anthropic"
+            return _call_with_retry(_call_anthropic_direct, transcript, anthropic_key), "llm_anthropic"
         except Exception as e:
             print(f"[soap_generator] Anthropic API call failed, falling back: {type(e).__name__}: {e}")
 
     if openrouter_key:
         try:
-            return _call_openrouter(transcript, openrouter_key), "llm_openrouter"
+            return _call_with_retry(_call_openrouter, transcript, openrouter_key), "llm_openrouter"
         except Exception as e:
             print(f"[soap_generator] OpenRouter API call failed, falling back: {type(e).__name__}: {e}")
 

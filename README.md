@@ -19,6 +19,14 @@ patient record — the UI deliberately labels every note "DRAFT — review befor
 reflect that. Frame it this way in your report/viva: it's solving a *time* problem
 (paperwork), not a *diagnostic* problem.
 
+## Security and deployment defaults
+
+- Set a strong `CLINICAL_SCRIBE_API_KEY` in `backend/.env` if you expose the service beyond a
+  single local machine. The backend checks the `X-API-Key` header on protected endpoints.
+- Use `CORS_ORIGINS` in `backend/.env` to restrict browser origins when hosting remotely.
+- Start with the included `Dockerfile` for a simpler deployment setup.
+- A `.githooks/pre-commit` scanner blocks obvious API keys before they are committed.
+
 ---
 
 ## 1. What It Actually Does

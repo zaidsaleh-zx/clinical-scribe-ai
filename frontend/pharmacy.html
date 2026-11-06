@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ClinicalScribe AI — Pharmacy Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Source+Sans+3:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css" />
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+  <style>
+    :root {
+      --bg: #f4fbf8;
+      --card: rgba(255,255,255,0.9);
+      --card-strong: #ffffff;
+      --border: #dfeae6;
+      --text: #18342d;
+      --muted: #56756f;
+      --brand: #059669;
+      --brand-deep: #047857;
+      --brand-soft: #e8fff7;
+      --warning: #f59e0b;
+      --warning-soft: #fff6db;
+      --danger: #dc2626;
+      --danger-soft: #fee2e2;
+      --success: #10b981;
+      --success-soft: #d1fae5;
+      --shadow: 0 12px 32px rgba(13, 39, 33, 0.08);
+    }
+    body[data-theme="dark"] {
+      --bg: #0f1c1a;
+      --card: rgba(18,32,29,0.94);
+      --card-strong: #122a26;
+      --border: rgba(130,177,165,0.2);
+      --text: #edfdf8;
+      --muted: #b9d7cf;
+      --brand-soft: rgba(5,150,105,0.12);
+      --warning-soft: rgba(245,158,11,0.13);
+      --danger-soft: rgba(220,38,38,0.11);
+      --success-soft: rgba(16,185,129,0.12);
+      --shadow: 0 18px 44px rgba(2, 12, 10, 0.35);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: 'Source Sans 3', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    .pharmacy-shell {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 2rem 1.25rem 3rem;
+    }
+    .pharmacy-header {
+      background: linear-gradient(135deg, var(--brand) 0%, var(--brand-deep) 100%);
+      color: white;
+      border-radius: 1.25rem;
+      padding: 1.5rem 1.75rem;
+      margin-bottom: 1.5rem;
+      box-shadow: var(--shadow);
+    }
+    .pharmacy-header-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+    }
+    .pharmacy-header h1 {
+      margin: 0;
+      font-family: 'Fraunces', serif;
+      font-size: clamp(1.6rem, 3.4vw, 2.4rem);
+    }
+    .pharmacy-header p {
+      margin: 0.5rem 0 0;
+      opacity: 0.92;
+    }
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    .nav-link {
+      color: rgba(255,255,255,0.92);
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 0.9rem;
+    }
+    .refresh-btn {
+      background: rgba(255,255,255,0.16);
+      border: 1px solid rgba(255,255,255,0.25);
+      color: white;
+      border-radius: 0.7rem;
+      padding: 0.7rem 1rem;
+      font-size: 0.9rem;
+      cursor: pointer;
+    }
+    .stats-row {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 1rem;
+      margin-bottom: 1.75rem;
+    }
+    .stat-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 1rem;
+      padding: 1.25rem;
+      box-shadow: var(--shadow);
+    }
+    .stat-card h3 {
+      margin: 0 0 0.5rem;
+      font-size: 0.76rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+    .stat-card .value {
+      font-size: clamp(1.7rem, 2.6vw, 2.3rem);
+      font-weight: 700;
+      color: var(--brand);
+      line-height: 1.1;
+    }
+    .panel {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 1rem;
+      overflow: hidden;
+      box-shadow: var(--shadow);
+    }
+    .table-wrap {
+      overflow-x: auto;
+    }
+    .order-table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 860px;
+    }
+    .order-table th,
+    .order-table td {
+      padding: 1rem 1.1rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    .order-table th {
+      background: rgba(5,150,105,0.04);
+      color: var(--muted);
+      font-size: 0.8rem;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+    .order-table tbody tr:hover {
+      background: rgba(5,150,105,0.02);
+    }
+    .status-badge {
+      display: inline-block;
+      padding: 0.32rem 0.7rem;
+      border-radius: 999px;
+      font-size: 0.74rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .status-pending { background: var(--warning-soft); color: #9a6400; }
+    .status-dispensed { background: var(--success-soft); color: #0a7d5a; }
+    .status-cancelled { background: var(--danger-soft); color: #a42727; }
+    .med-name {
+      font-weight: 700;
+      margin-bottom: 0.2rem;
+    }
+    .patient-info {
+      color: var(--muted);
+      font-size: 0.84rem;
+      margin-top: 0.1rem;
+    }
+    .med-dosage {
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 0.85rem;
+      color: var(--text);
+      background: rgba(15, 23, 42, 0.04);
+      border-radius: 0.5rem;
+      padding: 0.2rem 0.45rem;
+      display: inline-block;
+    }
+    .table-actions {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+    .btn-dispense {
+      background: var(--brand);
+      color: white;
+      border: none;
+      border-radius: 0.6rem;
+      padding: 0.55rem 0.85rem;
+      font-size: 0.82rem;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .btn-dispense:hover { background: var(--brand-deep); }
+    .btn-dispense:disabled,
+    .btn-secondary:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    .btn-secondary {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 0.6rem;
+      padding: 0.55rem 0.8rem;
+      font-size: 0.82rem;
+      cursor: pointer;
+    }
+    .empty-state {
+      text-align: center;
+      padding: 3rem 1rem;
+      color: var(--muted);
+    }
+    .empty-state svg {
+      width: 4rem;
+      height: 4rem;
+      margin-bottom: 1rem;
+      opacity: 0.35;
+    }
+    .panel-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 1rem 1.2rem;
+      border-bottom: 1px solid var(--border);
+      background: rgba(5,150,105,0.03);
+    }
+    .panel-toolbar h2 {
+      margin: 0;
+      font-size: 1.1rem;
+    }
+    .filter-row {
+      display: flex;
+      gap: 0.75rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    select {
+      background: var(--card-strong);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 0.65rem;
+      padding: 0.55rem 0.75rem;
+      font-size: 0.9rem;
+    }
+    @media (max-width: 860px) {
+      .stats-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .pharmacy-header-row { align-items: flex-start; flex-direction: column; }
+      .top-actions { width: 100%; justify-content: space-between; }
+    }
+    @media (max-width: 480px) {
+      .stats-row { grid-template-columns: 1fr; }
+      .pharmacy-shell { padding-inline: 0.85rem; }
+    }
+  </style>
+</head>
+<body data-theme="dark">
+  <div class="pharmacy-shell">
+    <header class="pharmacy-header">
+      <div class="pharmacy-header-row">
+        <div>
+          <h1>Pharmacy Dashboard</h1>
+          <p>Dispense-ready prescriptions generated from the current SOAP note.</p>
+        </div>
+        <div class="top-actions">
+          <a class="nav-link" href="/">Back to clinical note</a>
+          <button class="refresh-btn" id="refreshOrders">Refresh</button>
+        </div>
+      </div>
+    </header>
+
+    <section class="stats-row">
+      <div class="stat-card">
+        <h3>Total Orders</h3>
+        <div class="value" id="totalOrders">0</div>
+      </div>
+      <div class="stat-card">
+        <h3>Pending</h3>
+        <div class="value" id="pendingOrders">0</div>
+      </div>
+      <div class="stat-card">
+        <h3>Dispensed</h3>
+        <div class="value" id="dispensedOrders">0</div>
+      </div>
+      <div class="stat-card">
+        <h3>Cancelled</h3>
+        <div class="value" id="cancelledOrders">0</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-toolbar">
+        <h2>Prescription queue</h2>
+        <div class="filter-row">
+          <label for="statusFilter">Status</label>
+          <select id="statusFilter">
+            <option value="all">All</option>
+            <option value="pending">Pending</option>
+            <option value="dispensed">Dispensed</option>
+            <option value="cancelled">Cancelled</option>
+          </select>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="order-table">
+          <thead>
+            <tr>
+              <th>Patient</th>
+              <th>Medication</th>
+              <th>Dosage</th>
+              <th>Frequency</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="ordersTableBody"></tbody>
+        </table>
+      </div>
+      <div id="emptyState" class="empty-state" hidden>
+        <svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <path d="M16 18h32v28c0 2.2-1.8 4-4 4H20c-2.2 0-4-1.8-4-4V18Z" stroke="currentColor" stroke-width="3"/>
+          <path d="M24 12h16v10H24z" stroke="currentColor" stroke-width="3"/>
+          <path d="M22 29h20M22 37h20M22 45h12" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+        </svg>
+        <div>No prescriptions match the selected filter.</div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const API_BASE = window.location.protocol === 'file:' ? 'http://127.0.0.1:8000' : '';
+    const statusFilter = document.getElementById('statusFilter');
+    const ordersTableBody = document.getElementById('ordersTableBody');
+    const emptyState = document.getElementById('emptyState');
+    const totalOrdersEl = document.getElementById('totalOrders');
+    const pendingOrdersEl = document.getElementById('pendingOrders');
+    const dispensedOrdersEl = document.getElementById('dispensedOrders');
+    const cancelledOrdersEl = document.getElementById('cancelledOrders');
+    const refreshButton = document.getElementById('refreshOrders');
+
+    let allOrders = [];
+
+    function formatPatientName(order) {
+      const first = order.first_name || '';
+      const last = order.last_name || '';
+      const name = [first, last].filter(Boolean).join(' ');
+      return name || 'Unknown patient';
+    }
+
+    function renderStats(list) {
+      totalOrdersEl.textContent = String(list.length);
+      pendingOrdersEl.textContent = String(list.filter(o => o.status === 'pending').length);
+      dispensedOrdersEl.textContent = String(list.filter(o => o.status === 'dispensed').length);
+      cancelledOrdersEl.textContent = String(list.filter(o => o.status === 'cancelled').length);
+    }
+
+    function normalizeStatus(value) {
+      return (value || '').toLowerCase();
+    }
+
+    function statusBadge(status) {
+      const normalized = normalizeStatus(status);
+      return `<span class="status-badge status-${normalized || 'pending'}">${normalized || 'pending'}</span>`;
+    }
+
+    function getVisibleOrders() {
+      const filterValue = statusFilter.value;
+      if (filterValue === 'all') return allOrders;
+      return allOrders.filter(order => normalizeStatus(order.status) === filterValue);
+    }
+
+    function renderTable() {
+      const visibleOrders = getVisibleOrders();
+      if (!visibleOrders.length) {
+        ordersTableBody.innerHTML = '';
+        emptyState.hidden = false;
+        return;
+      }
+      emptyState.hidden = true;
+
+      ordersTableBody.innerHTML = visibleOrders.map((order) => {
+        const isPending = normalizeStatus(order.status) === 'pending';
+        return `
+          <tr>
+            <td>
+              <div class="med-name">${escapeHtml(formatPatientName(order))}</div>
+              <div class="patient-info">Consultation: ${escapeHtml(order.consultation_id || 'n/a')}</div>
+            </td>
+            <td>
+              <div class="med-name">${escapeHtml(order.medication || 'Unspecified medication')}</div>
+              <div class="patient-info">${escapeHtml(order.instructions || 'No instructions')}</div>
+            </td>
+            <td><span class="med-dosage">${escapeHtml(order.dosage || '—')}</span></td>
+            <td>${escapeHtml(order.frequency || '—')}</td>
+            <td>${statusBadge(order.status)}</td>
+            <td>
+              <div class="table-actions">
+                <button class="btn-dispense" data-order-id="${order.id}" ${isPending ? '' : 'disabled'}>
+                  ${isPending ? 'Mark dispensed' : 'Dispensed'}
+                </button>
+                <button class="btn-secondary" data-cancel-id="${order.id}" ${normalizeStatus(order.status) === 'cancelled' ? 'disabled' : ''}>
+                  Cancel
+                </button>
+              </div>
+            </td>
+          </tr>
+        `;
+      }).join('');
+
+      document.querySelectorAll('[data-order-id]').forEach((button) => {
+        button.addEventListener('click', () => updateOrderStatus(button.dataset.orderId, 'dispensed'));
+      });
+      document.querySelectorAll('[data-cancel-id]').forEach((button) => {
+        button.addEventListener('click', () => updateOrderStatus(button.dataset.cancelId, 'cancelled'));
+      });
+    }
+
+    async function updateOrderStatus(orderId, status) {
+      try {
+        const response = await fetch(`${API_BASE}/api/pharmacy/orders/${orderId}/status`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status })
+        });
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({ error: 'Update failed' }));
+          throw new Error(payload.error || 'Update failed');
+        }
+        await loadOrders();
+      } catch (err) {
+        alert(`Could not update order: ${err.message}`);
+      }
+    }
+
+    async function loadOrders() {
+      try {
+        const response = await fetch(`${API_BASE}/api/pharmacy/orders`);
+        if (!response.ok) throw new Error('Unable to load pharmacy orders');
+        allOrders = await response.json();
+        renderStats(allOrders);
+        renderTable();
+      } catch (err) {
+        ordersTableBody.innerHTML = '';
+        emptyState.hidden = false;
+        emptyState.innerHTML = `<div style="color: var(--danger); font-weight: 600;">${escapeHtml(err.message)}</div>`;
+      }
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
+    statusFilter.addEventListener('change', renderTable);
+    refreshButton.addEventListener('click', loadOrders);
+    loadOrders();
+  </script>
+</body>
+</html>

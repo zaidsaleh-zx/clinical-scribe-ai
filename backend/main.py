@@ -23,13 +23,15 @@ import re
 import string
 import time
 import urllib.request
+from collections import defaultdict, deque
 from datetime import timedelta
+from typing import Optional
 from dotenv import load_dotenv
 load_dotenv()  # loads variables from a local .env file, if one exists (see .env.example)
 
 import json
 import uuid
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
@@ -110,6 +112,93 @@ def _normalize_for_dedup(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 app = FastAPI(title="Clinical Documentation Assistant")
+
+# A tiny, self-contained security layer: when a real API key is configured, protect
+# the writeable or patient-sensitive routes while leaving the public health/status
+# checks and local demo flows usable without friction.
+API_KEY_NAMES = ("CLINICAL_SCRIBE_API_KEY", "API_KEY")
+PUBLIC_PATHS = {
+    "/api/health",
+    "/api/status",
+    "/api/sample-transcript",
+    "/docs",
+    "/openapi.json",
+    "/redoc",
+    "/ws/session",
+}
+REQUEST_BUCKETS = defaultdict(deque)
+
+
+def _get_configured_api_key() -> Optional[str]:
+    for name in API_KEY_NAMES:
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def _require_api_key() -> bool:
+    return _get_configured_api_key() is not None
+
+
+def _skip_auth(path: str) -> bool:
+    if path in PUBLIC_PATHS:
+        return True
+    return path.startswith("/static/") or path.startswith("/assets/")
+
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    if _require_api_key() and not _skip_auth(path):
+        expected = _get_configured_api_key()
+        provided = request.headers.get("x-api-key") or request.headers.get("authorization", "").replace("Bearer ", "", 1).strip()
+        if not expected or provided != expected:
+            return Response(
+                status_code=401,
+                content=json.dumps({"error": "Unauthorized: provide a valid X-API-Key header."}),
+                media_type="application/json",
+            )
+
+    if path.startswith("/api/generate-note") or path.startswith("/api/export-pdf"):
+        client_ip = request.client.host if request.client else "anonymous"
+        now = time.monotonic()
+        bucket = REQUEST_BUCKETS[client_ip]
+        while bucket and now - bucket[0] > 60:
+            bucket.popleft()
+        if len(bucket) >= 12:
+            return Response(
+                status_code=429,
+                content=json.dumps({"error": "Too many requests. Please slow down."}),
+                media_type="application/json",
+            )
+        bucket.append(now)
+
+    return await call_next(request)
+
+
+def validate_runtime_config() -> None:
+    """Warn on obvious misconfiguration so the app doesn't silently fall back to a dead mode."""
+    warnings = []
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    if anthropic_key and not anthropic_key.startswith("sk-ant-"):
+        warnings.append("ANTHROPIC_API_KEY does not look like a valid Anthropic key (expected sk-ant-*)")
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+    if openrouter_key and not openrouter_key.startswith("sk-or-"):
+        warnings.append("OPENROUTER_API_KEY does not look like a valid OpenRouter key (expected sk-or-*)")
+    api_key = _get_configured_api_key()
+    if api_key and len(api_key) < 16:
+        warnings.append("CLINICAL_SCRIBE_API_KEY is set but looks unusually short")
+    for message in warnings:
+        logger.warning(message)
+
+@app.on_event("startup")
+def startup_validation():
+    validate_runtime_config()
+
 
 app.add_middleware(
     CORSMiddleware,
