@@ -275,6 +275,8 @@
         </label>
         <button class="btn btn-record" id="recordBtn"><span class="rec-dot"></span> ● Start Recording</button>
         <span class="record-timer" id="recordTimer">00:00</span>
+        <span class="mic-status" id="micStatus">Standby</span>
+        <div class="mic-meter" aria-hidden="true"><div class="mic-meter-fill" id="micLevelFill"></div></div>
         <button class="btn btn-secondary" id="resetSessionBtn">↺ Reset Session</button>
       </div>
     </section>
@@ -309,6 +311,13 @@
         </div>
         <div class="transcript-feed" id="transcriptFeed">
           <div class="empty-state">Transcript will appear here as the consultation happens.</div>
+          <!-- Live "…listening" tail: shown between completed sentences while Whisper
+               is still holding back the current fragment. Created/filled by
+               renderPartialTranscript() in app.js and cleared by clearPartialTail(). -->
+          <div id="partialTailEl" class="partial-tail">
+            <span class="speaker-icon">👂</span>
+            <span><em class="partial-text"></em></span>
+          </div>
         </div>
       </div>
 

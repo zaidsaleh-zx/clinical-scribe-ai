@@ -14,7 +14,11 @@ if %errorlevel%==0 (
   echo [OK] Backend is already running on port 8000.
 ) else (
   echo [..] Starting backend server...
-  start "ClinicalScribe AI server" /min python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
+  rem Prefer the diarization-capable virtual environment when present.
+  set "PYTHON=python"
+  if exist ".venv-1\Scripts\python.exe" set "PYTHON=.venv-1\Scripts\python.exe"
+  if not exist ".venv-1\Scripts\python.exe" if exist ".venv\Scripts\python.exe" set "PYTHON=.venv\Scripts\python.exe"
+  start "ClinicalScribe AI server" /min "%PYTHON%" -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --ws-ping-interval 3600 --ws-ping-timeout 3600
   
   rem Wait for the server to become ready
   set "READY=0"

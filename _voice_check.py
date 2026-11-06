@@ -8,7 +8,6 @@
 import io
 import json
 import os
-import struct
 import sys
 import wave
 
@@ -68,11 +67,12 @@ def main():
     # 2. faster-whisper engine: load cached model + transcribe silence WAV
     try:
         from transcription import get_model, transcribe_audio_bytes
-        model = get_model("base.en")
+        model_size = os.environ.get("WHISPER_MODEL", "small")
+        model = get_model(model_size)
         log(f"[engine] loaded={type(model).__module__}.{type(model).__name__}")
         wav = make_wav()
-        text = transcribe_audio_bytes(wav, model_size="base.en")
-        log(f"[engine] transcribe(silence) -> '{text}' (empty expected, no exception = OK)")
+        text, language = transcribe_audio_bytes(wav, model_size=model_size)
+        log(f"[engine] transcribe(silence) -> '{text}' (language={language}; empty expected)")
         ok &= isinstance(text, str)
     except Exception as e:
         log(f"[engine] FAIL {type(e).__name__}: {e}")

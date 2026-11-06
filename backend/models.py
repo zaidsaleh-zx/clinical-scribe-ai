@@ -48,3 +48,19 @@ class SessionState(BaseModel):
     session_id: str
     transcript_lines: List[str] = []
     speaker_hint: Optional[str] = "patient"  # toggled by frontend as consult alternates
+
+
+class SubmitSessionRequest(BaseModel):
+    consultation_id: str
+    note: dict
+    patient: PatientInfo = PatientInfo()
+    auto_route: bool = True
+
+
+class PharmacyOrderStatusRequest(BaseModel):
+    status: str  # pending | dispensed | cancelled
+
+
+class LaboratoryOrderStatusRequest(BaseModel):
+    status: str  # pending | completed | cancelled
+    result: Optional[str] = None

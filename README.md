@@ -347,13 +347,18 @@ starting uvicorn works too — it just needs to be re-run every time you open a 
   uses conversation cues: questions, instructions, examinations, and diagnoses favor the
   Doctor; first-person symptoms and body-condition reports favor the Patient. Ambiguous
   fragments retain the last confident role instead of randomly switching.
-- For real Doctor/Patient separation, install the optional `pyannote.audio` dependency,
-  configure `HUGGINGFACE_TOKEN`, enable `DIARIZATION_ENABLED`, and use a quiet microphone
-  setup. This requires additional model downloads and should be evaluated with
-  de-identified recordings before clinical use.
-- The default English model is `base.en` for responsive CPU live updates. Use
-  `WHISPER_MODEL=small.en` when accuracy matters more than latency; it downloads a larger
-  model and takes longer per chunk. No offline model guarantees
+- For real Doctor/Patient separation by voice, the backend runs optional speaker
+  diarization at "Stop Recording" (finalize) using `pyannote.audio`. It needs the
+  `pyannote-audio` + `torch` dependencies, a Hugging Face token in `backend/.env`
+  (`HF_TOKEN`, or `HUGGINGFACE_TOKEN` as a fallback), and you must accept the license on
+  **both** model cards with that account: `pyannote/speaker-diarization-3.1` and
+  `pyannote/speaker-diarization-community-1`. Diarization is best-effort — if anything
+  fails at finalize the transcript simply keeps the live heuristic speaker labels, so the
+  app never breaks without it.
+- The default speech model is the multilingual `base` (auto-detects English/Urdu/mixed).
+  Use `WHISPER_MODEL=small` when accuracy matters more than latency; it downloads a
+  larger model and takes longer per chunk. Do not use `.en`-suffixed models — the
+  backend rejects them because they are English-only. No offline model guarantees
   every accent or every word under noise, overlap, or speaker playback.
 
 ## 9. Good Stretch Goals (still open)

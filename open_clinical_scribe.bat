@@ -16,13 +16,21 @@ if not exist "backend\main.py" (
   exit /b 1
 )
 
-rem Prefer the project virtual environment so faster-whisper and the other
-rem installed dependencies are the same ones used during development.
+rem Prefer the diarization-capable project virtual environment (has
+rem pyannote.audio + torch) so both faster-whisper and speaker diarization
+rem are available; fall back to the plain .venv otherwise.
 set "PYTHON=python"
-if exist ".venv\Scripts\python.exe" set "PYTHON=.venv\Scripts\python.exe"
+if exist ".venv-1\Scripts\python.exe" (
+  set "PYTHON=.venv-1\Scripts\python.exe"
+) else (
+  if exist ".venv\Scripts\python.exe" set "PYTHON=.venv\Scripts\python.exe"
+)
 
 rem Start the FastAPI app in a separate minimized window.
-start "ClinicalScribe AI server" /min "%PYTHON%" -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
+rem --ws-ping-interval/--ws-ping-timeout 3600: slow CPU Whisper passes must never
+rem trip the websocket ping/pong watchdog (some non-browser clients can't pong
+rem while a pass is decoding). Browsers are unaffected.
+start "ClinicalScribe AI server" /min "%PYTHON%" -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --ws-ping-interval 3600 --ws-ping-timeout 3600
 
 rem Give Uvicorn a short moment to bind, then open the dashboard.
 for /l %%i in (1,1,20) do (

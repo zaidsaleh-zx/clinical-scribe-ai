@@ -321,11 +321,24 @@ class SoapNote:
 
 
 def _split_speaker(line: str) -> Tuple[Optional[str], str]:
-    """Returns (speaker, text) if the line has a 'Doctor:'/'Patient:' prefix, else (None, line)."""
-    m = re.match(r"^\s*(doctor|dr\.?\s?\w*|patient|physician)\s*:\s*(.*)", line, re.IGNORECASE)
+    """Returns (speaker, text) if the line has a 'Doctor:'/'Patient:' prefix, else (None, line).
+
+    Only full label words are recognized, so an ordinary sentence that merely
+    begins with a "dr..." word (e.g. "Drainage: ...") is NOT mistaken for a
+    doctor turn. "Doctor:", "Dr:", "Dr. Lastname:", "Dr Lastname:" and
+    "Physician:" count as doctor; "Patient:" counts as patient.
+    """
+    m = re.match(r"^\s*([^:]+):\s*(.*)", line)
     if m:
-        speaker = "doctor" if "doctor" in m.group(1).lower() or "dr" in m.group(1).lower() or "physician" in m.group(1).lower() else "patient"
-        return speaker, m.group(2).strip()
+        label = m.group(1).strip().lower()
+        if (
+            label in ("doctor", "dr", "physician")
+            or label.startswith("dr.")
+            or re.match(r"^dr\s+[a-z]", label)
+        ):
+            return "doctor", m.group(2).strip()
+        if label == "patient":
+            return "patient", m.group(2).strip()
     return None, line.strip()
 
 
@@ -681,6 +694,7 @@ def _call_with_retry(func, *args, retries: int = 2, base_delay: float = 0.6, **k
             delay = base_delay * (2 ** attempt)
             time.sleep(delay)
     raise last_error
+
 
 def generate_soap_llm(transcript: str, api_key: str = None):
     """

@@ -2,10 +2,15 @@
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-rem Prefer the project virtual environment so Live Audio uses the installed
-rem faster-whisper dependency instead of an unrelated system Python.
+rem Prefer the diarization-capable project virtual environment (has
+rem pyannote.audio + torch) so both faster-whisper and speaker diarization
+rem are available; fall back to the plain .venv otherwise.
 set "PYTHON=python"
-if exist ".venv\Scripts\python.exe" set "PYTHON=.venv\Scripts\python.exe"
+if exist ".venv-1\Scripts\python.exe" (
+  set "PYTHON=.venv-1\Scripts\python.exe"
+) else (
+  if exist ".venv\Scripts\python.exe" set "PYTHON=.venv\Scripts\python.exe"
+)
 
 echo ============================================================
 echo   ClinicalScribe AI - Phone Server Launcher
@@ -19,7 +24,7 @@ if %errorlevel%==0 (
   echo [OK] Backend already running on port 8000.
 ) else (
   echo [..] Starting backend server...
-  start "ClinicalScribe AI Backend" /min cmd /c "cd /d "%~dp0" && "%PYTHON%" -m uvicorn backend.main:app --host 0.0.0.0 --port 8000"
+  start "ClinicalScribe AI Backend" /min cmd /c "cd /d "%~dp0" && "%PYTHON%" -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --ws-ping-interval 3600 --ws-ping-timeout 3600"
   
   rem Wait for the server to become ready
   set "READY=0"

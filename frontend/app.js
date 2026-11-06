@@ -230,6 +230,66 @@ function renderTranscriptLine(line, sourceIndex = null) {
   countEl.textContent = `${n} line${n === 1 ? "" : "s"}`;
 }
 
+function clearPartialTail() {
+  const el = document.getElementById("partialTailEl");
+  if (!el) return;
+  el.remove();
+  const feed = document.getElementById("transcriptFeed");
+  if (feed) feed.scrollTop = feed.scrollHeight;
+}
+
+// Shows the fragment Whisper is currently hearing but holding back (it may
+// still change as more audio arrives). Keeps the feed feeling "live" between
+// completed sentences, and disappears once a sentence is finalized or
+// the session is cleared.
+function renderPartialTranscript(text) {
+  const feed = document.getElementById("transcriptFeed");
+  if (!feed) return;
+  const cleaned = (text || "").trim();
+  let partialEl = document.getElementById("partialTailEl");
+  if (!cleaned) {
+    clearPartialTail();
+    return;
+  }
+  // Update the existing line IN PLACE (no remove/re-create) so the tail grows
+  // word by word without flickering under frequent streaming updates.
+  if (!partialEl) {
+    const empty = feed.querySelector(".empty-state");
+    if (empty) empty.remove();
+    partialEl = document.createElement("div");
+    partialEl.id = "partialTailEl";
+    partialEl.className = "partial-tail";
+    partialEl.innerHTML = `<span class="speaker-icon">👂</span><span><em class="partial-text"></em></span>`;
+    feed.appendChild(partialEl);
+  }
+  partialEl.querySelector(".partial-text").textContent = "…" + cleaned;
+  feed.scrollTop = feed.scrollHeight;
+}
+
+// Replaces the text of an existing transcript line (used when the backend says
+// a newer decode is a fuller version of the previous line - same words, more
+// detail - so we never show the same words twice).
+function replaceTranscriptLine(line, sourceIndex) {
+  const feed = document.getElementById("transcriptFeed");
+  const existing = feed.querySelector(`[data-transcript-index="${sourceIndex}"]`);
+  if (!existing) return renderTranscriptLine(line, sourceIndex);
+  const isDoctor = /^doctor\s*:/i.test(line) || /^dr\.?\s*\w*:/i.test(line);
+  existing.className = "transcript-line" + (isDoctor ? " speaker-doctor" : "");
+  const m = line.match(/^([^:]+):\s*(.*)/);
+  if (m && existing.children.length >= 2) {
+    const wrap = existing.children[1];
+    while (wrap.firstChild) wrap.removeChild(wrap.firstChild);
+    const sp = document.createElement("span");
+    sp.className = "speaker";
+    sp.textContent = m[1] + ":";
+    wrap.appendChild(sp);
+    wrap.appendChild(document.createTextNode(" " + m[2]));
+  } else {
+    existing.textContent = line;
+  }
+  feed.scrollTop = feed.scrollHeight;
+}
+
 function escapeHtml(str) {
   const div = document.createElement("div");
   div.textContent = str;
@@ -238,6 +298,8 @@ function escapeHtml(str) {
 
 function clearTranscript() {
   const feed = document.getElementById("transcriptFeed");
+  const partial = document.getElementById("partialTailEl");
+  if (partial) partial.remove();
   feed.innerHTML = `<div class="empty-state">Transcript will appear here as the consultation happens.</div>`;
   document.getElementById("transcriptCount").textContent = "0 lines";
   currentTranscript = "";
@@ -553,9 +615,55 @@ let processorNode = null;
 let pcmBuffer = [];
 let audioSendTimer = null;
 let captureSampleRate = 16000;
+// State for the one-pole DC-offset blocker applied to the raw mic samples —
+// removes low-frequency rumble / mic hum that confuses Whisper's VAD and
+// makes the captured voice sound muddy. Reset on every recording start.
+const DC_ALPHA = 0.995;
+let dcPrevSample = 0.0;
+let dcLastOut = 0.0;
+// Live input-level metering: accumulated energy updated by the audio callback,
+// rendered ~4x/second so the user can SEE the app is listening to the mic.
+let micEnergy = 0.0;
+let micEnergyCount = 0;
+let meterTimer = null;
+
+function setMicStatus(text) {
+  const el = document.getElementById("micStatus");
+  if (el) el.textContent = text;
+}
+
+function updateMicMeter() {
+  const fill = document.getElementById("micLevelFill");
+  if (!fill) return;
+  const rms = micEnergyCount > 0 ? Math.sqrt(micEnergy / micEnergyCount) : 0;
+  micEnergy = 0;
+  micEnergyCount = 0;
+  if (!isRecording) {
+    fill.style.width = "4%";
+    fill.classList.remove("loud", "live");
+    setMicStatus("Standby");
+    return;
+  }
+  const level = Math.min(1, rms * 5);
+  fill.style.width = Math.max(4, Math.round(level * 100)) + "%";
+  if (level > 0.18) {
+    fill.classList.add("loud");
+    fill.classList.remove("live");
+    setMicStatus("Speaking…");
+  } else if (level > 0.02) {
+    fill.classList.remove("loud", "live");
+    setMicStatus("Listening…");
+  } else {
+    fill.classList.remove("loud");
+    fill.classList.add("live");
+    setMicStatus("Listening…");
+  }
+}
 
 // How often buffered PCM is packaged into a WAV and pushed to the backend.
-const AUDIO_CHUNK_MS = 2500;
+// 1s means a new Whisper pass starts ~once a second while speaking, so the
+// transcript fills in roughly word by word instead of in 2s+ sentence clumps.
+const AUDIO_CHUNK_MS = 1000;
 
 function connectWebSocket() {
   const backendUrl = API_BASE || window.location.origin;
@@ -566,8 +674,23 @@ function connectWebSocket() {
     const msg = JSON.parse(event.data);
     if (msg.type === "transcript_update") {
       setPipelineStep("transcribe");
-      renderTranscriptLine(msg.line, msg.line_index);
+      // A fragment just committed - hide the live "…listening" tail so the
+      // same words never appear twice.
+      clearPartialTail();
+      if (msg.replace) {
+        replaceTranscriptLine(msg.line, msg.line_index);
+      } else {
+        renderTranscriptLine(msg.line, msg.line_index);
+      }
       currentTranscript = msg.full_transcript;
+    } else if (msg.type === "transcript_reset") {
+      // Finalize-time diarization rewrote the whole transcript with the
+      // accurate Doctor/Patient labels — clear the feed so the corrected
+      // lines REPLACE the live _infer_speaker() heuristic-guess lines
+      // instead of being appended underneath them.
+      clearTranscript();
+    } else if (msg.type === "partial_transcript") {
+      renderPartialTranscript(msg.text || "");
     } else if (msg.type === "transcribing") {
       setPipelineStep("transcribe");
     } else if (msg.type === "note_update") {
@@ -575,7 +698,7 @@ function connectWebSocket() {
       renderNote(msg.note);
     } else if (msg.type === "error") {
       console.error("Backend error:", msg.message);
-      alert(msg.message);
+      setMicStatus("Error: " + msg.message);
     } else if (msg.type === "reset_ack") {
       clearTranscript();
       clearNote();
@@ -586,6 +709,21 @@ function connectWebSocket() {
   return new Promise((resolve, reject) => {
     ws.onopen = () => resolve();
     ws.onerror = () => reject(new Error("Could not connect to the live transcription service."));
+    ws.onclose = () => {
+      setMicStatus("Reconnecting…");
+      // If the user is still recording when the socket drops, try once to
+      // reconnect instead of silently dropping all further audio.
+      if (isRecording) {
+        setTimeout(async () => {
+          try {
+            await connectWebSocket();
+            setMicStatus("Reconnected — Listening…");
+          } catch (e) {
+            setMicStatus("Reconnect failed — press Stop, then Start again.");
+          }
+        }, 1200);
+      }
+    };
   }).catch(err => {
     console.error("WebSocket connection failed:", err);
     throw err;
@@ -626,15 +764,36 @@ function audioSamplesToWav(samples, sampleRate) {
   return new Blob([buffer], { type: "audio/wav" });
 }
 
+// Gently lifts quiet microphones so Whisper receives consistently audible
+// speech. Peak-normalizes to ~0.45 and never attenuates (loud sources are left
+// untouched, avoiding distortion/pumping). Quiet speech is the #1 cause of
+// dropped/mis-heard words, so this is a big accuracy win for "clear and neat".
+function normalizeSamples(samples) {
+  let peak = 0.0;
+  for (let i = 0; i < samples.length; i++) {
+    const v = samples[i] >= 0 ? samples[i] : -samples[i];
+    if (v > peak) peak = v;
+  }
+  if (peak < 1e-4) return;
+  // Boost quiet mics HARD (up to 12x, target peak 0.6). Whisper's voice-activity
+  // filter treats faint audio as silence and returns NO text — a quiet laptop/phone
+  // mic was the #1 "listening but not converting" cause. Loud sources (gain <= 1)
+  // are left untouched, and the WAV encoder clamps to [-1, 1] as a safety net.
+  const gain = Math.min(12.0, 0.6 / peak);
+  if (gain <= 1.0) return;
+  for (let i = 0; i < samples.length; i++) samples[i] *= gain;
+}
+
 function flushAudioToBackend(force = false) {
-  // Don't bother the backend with sub-100ms slivers during live capture.
-  if (!force && pcmBuffer.length < 1600) return;
+  // Don't bother the backend with sub-50ms slivers during live capture.
+  if (!force && pcmBuffer.length < 800) return;
   if (!ws || ws.readyState !== WebSocket.OPEN || pcmBuffer.length === 0) {
     pcmBuffer.length = 0;
     return;
   }
   const samples = new Float32Array(pcmBuffer);
   pcmBuffer.length = 0;
+  normalizeSamples(samples);
   ws.send(audioSamplesToWav(samples, captureSampleRate));
 }
 
@@ -648,8 +807,39 @@ async function startDirectAudio() {
     audioContext = new AudioCtx();
   }
   captureSampleRate = audioContext.sampleRate || 16000;
+  // Fresh DC-blocker state for this recording.
+  dcPrevSample = 0.0;
+  dcLastOut = 0.0;
 
-  sourceNode = audioContext.createMediaStreamSource(mediaStream);
+  // Prefer the CURRENT AudioStream API (createAudioStreamSource) — the old
+  // createMediaStreamSource(MediaStream) API is deprecated and can throw on
+  // Safari / some Chrome versions. Deriving the AudioStream from the first
+  // audio track works identically and keeps every browser listening.
+  let audioStreamSource = null;
+  try {
+    const tracks = mediaStream && typeof mediaStream.getAudioTracks === "function"
+      ? mediaStream.getAudioTracks()
+      : [];
+    for (let t = 0; t < tracks.length; t++) {
+      const st = typeof tracks[t].getStream === "function" ? tracks[t].getStream() : null;
+      if (st) {
+        audioStreamSource = st;
+        break;
+      }
+    }
+    if (audioStreamSource && typeof audioContext.createAudioStreamSource === "function") {
+      sourceNode = audioContext.createAudioStreamSource(audioStreamSource);
+    } else {
+      sourceNode = audioContext.createMediaStreamSource(mediaStream);
+    }
+  } catch (err) {
+    if (audioContext.createMediaStreamSource) {
+      // Last-resort fallback for browsers without the modern API.
+      sourceNode = audioContext.createMediaStreamSource(mediaStream);
+    } else {
+      throw new Error("This browser cannot access the microphone audio stream (" + err.message + ").");
+    }
+  }
 
   // ScriptProcessor is deprecated but works in every browser, including Safari,
   // and needs no separate worklet file (important when served over http).
@@ -658,7 +848,17 @@ async function startDirectAudio() {
     // Tab capture can be multi-channel; each Float32 sample here is already
     // downmixed by the browser for the mono input buffer.
     const input = event.inputBuffer.getChannelData(0);
-    for (let i = 0; i < input.length; i++) pcmBuffer.push(input[i]);
+    for (let i = 0; i < input.length; i++) {
+      const cur = input[i];
+      // One-pole DC blocker: suppresses mic hum/rumble so Whisper hears the
+      // voice clearly instead of low-frequency noise that trips its VAD.
+      const out = cur - dcPrevSample + DC_ALPHA * dcLastOut;
+      dcPrevSample = cur;
+      dcLastOut = out;
+      pcmBuffer.push(out);
+      micEnergy += out * out;
+    }
+    micEnergyCount += input.length;
   };
   sourceNode.connect(processorNode);
 
@@ -672,6 +872,10 @@ async function startDirectAudio() {
   // Stream buffered audio to the backend on a fixed cadence so the transcript
   // and SOAP note update live while the user is speaking.
   audioSendTimer = setInterval(() => flushAudioToBackend(false), AUDIO_CHUNK_MS);
+  // Live input meter so the user can SEE the mic is being heard.
+  micEnergy = 0;
+  micEnergyCount = 0;
+  meterTimer = setInterval(updateMicMeter, 250);
 }
 
 function stopDirectAudio() {
@@ -679,6 +883,12 @@ function stopDirectAudio() {
     clearInterval(audioSendTimer);
     audioSendTimer = null;
   }
+  if (meterTimer) {
+    clearInterval(meterTimer);
+    meterTimer = null;
+  }
+  micEnergy = 0;
+  micEnergyCount = 0;
   if (processorNode) {
     try { processorNode.disconnect(); } catch (err) { /* noop */ }
     processorNode = null;
@@ -755,6 +965,7 @@ recordBtn.addEventListener("click", async () => {
     clearInterval(timerInterval);
     timerInterval = null;
     stopDirectAudio();
+    setMicStatus("Standby");
     if (ws && ws.readyState === WebSocket.OPEN) {
       setPipelineStep("analyze");
       // finalize: flush the last sentence fragment held back for punctuation and

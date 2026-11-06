@@ -14,3 +14,5 @@ services:
         sync: false
       - key: OPENROUTER_MODEL
         sync: false
+      - key: HF_TOKEN
+        sync: false
