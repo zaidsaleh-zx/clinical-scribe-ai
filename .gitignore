@@ -18,6 +18,7 @@ backend/sessions.db
 
 # --- ML model caches (Whisper downloads these on first run) ---
 .cache/
+models/hub/
 *.pt
 *.bin
 *.onnx

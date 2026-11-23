@@ -188,6 +188,8 @@
   </div>
 
   <div class="topbar-right">
+    <a class="order-dashboard-link" href="/lab.html">Laboratory dashboard</a>
+    <a class="order-dashboard-link" href="/pharmacy.html">Pharmacy dashboard</a>
     <div class="engine-status" id="engineStatus">
       <span class="status-chip" id="chipWhisper"><span class="chip-dot"></span>Whisper</span>
       <span class="status-chip" id="chipLlm"><span class="chip-dot"></span>Claude LLM</span>
@@ -362,7 +364,11 @@
         <div class="note-actions">
           <button class="btn btn-copy" id="copyBtn">📋 Copy SOAP</button>
           <button class="btn btn-save" id="saveSessionBtn">💾 Save to History</button>
+          <button class="btn btn-secondary" id="undoEditBtn" disabled>↶ Undo</button>
+          <button class="btn btn-secondary" id="redoEditBtn" disabled>↷ Redo</button>
           <button class="btn btn-pdf" id="exportPdfBtn">📄 Export PDF</button>
+          <button class="btn btn-secondary" id="exportJsonBtn">{} Export JSON</button>
+          <button class="btn btn-secondary" id="reviewOrdersBtn">Review proposed orders</button>
         </div>
       </div>
 
@@ -374,6 +380,7 @@
 <!-- No livekit-client CDN script needed: Live Audio streams PCM directly to the
      backend over the WebSocket, where the local faster-whisper model transcribes it.
      LiveKit Cloud transport remains available on the backend as an optional extra. -->
+<script src="auth.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

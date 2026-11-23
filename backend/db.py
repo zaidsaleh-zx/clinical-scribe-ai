@@ -17,8 +17,24 @@ import os
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
+from .order_routing import extract_lab_tests_from_soap, extract_medications_from_plan
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.db")
+DB_PATH = os.environ.get(
+    "CLINICAL_SCRIBE_DB_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.db"),
+)
+
+
+class OrdersAlreadyRoutedError(ValueError):
+    """Raised when an already-routed consultation is submitted again."""
+
+
+class InvalidLaboratoryOrderTransitionError(ValueError):
+    """Raised when a laboratory order is updated after leaving the pending state."""
+
+
+class InvalidPharmacyOrderTransitionError(ValueError):
+    """Raised when a pharmacy order is updated after leaving the pending state."""
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +536,52 @@ def get_session_full(session_id: str) -> Optional[dict]:
     }
 
 
+def delete_session(session_id: str) -> bool:
+    """Permanently remove one saved consultation and its associated PHI."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        consultation = conn.execute(
+            "SELECT patient_id FROM consultations WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if consultation is None:
+            conn.rollback()
+            return False
+
+        patient_id = consultation["patient_id"]
+        record_ids = [session_id]
+        for table in ("soap_notes", "pharmacy_orders", "laboratory_orders"):
+            rows = conn.execute(
+                f"SELECT id FROM {table} WHERE consultation_id = ?",
+                (session_id,),
+            ).fetchall()
+            record_ids.extend(row["id"] for row in rows)
+
+        placeholders = ",".join("?" for _ in record_ids)
+        conn.execute(
+            f"DELETE FROM audit_log WHERE record_id IN ({placeholders})",
+            record_ids,
+        )
+        conn.execute("DELETE FROM consultations WHERE id = ?", (session_id,))
+
+        remaining = conn.execute(
+            "SELECT 1 FROM consultations WHERE patient_id = ? LIMIT 1",
+            (patient_id,),
+        ).fetchone()
+        if remaining is None:
+            conn.execute("DELETE FROM audit_log WHERE record_id = ?", (patient_id,))
+            conn.execute("DELETE FROM patients WHERE id = ?", (patient_id,))
+
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Legacy migration (optional)
 # ---------------------------------------------------------------------------
@@ -647,6 +709,12 @@ def update_pharmacy_order_status(order_id: str, status: str) -> bool:
         ).fetchone()
         if not row:
             return False
+        if status not in {"pending", "dispensed", "cancelled"}:
+            raise ValueError(f"Unsupported pharmacy order status: {status}")
+        if row["status"] != "pending":
+            raise InvalidPharmacyOrderTransitionError(
+                f"Cannot change a pharmacy order from {row['status']} to {status}."
+            )
         old = dict(row)
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(
@@ -721,15 +789,23 @@ def update_laboratory_order_status(order_id: str, status: str,
         ).fetchone()
         if not row:
             return False
+        if status not in {"completed", "cancelled"}:
+            raise ValueError(f"Unsupported laboratory order status: {status}")
+        if row["status"] != "pending":
+            raise InvalidLaboratoryOrderTransitionError(
+                f"Cannot change a laboratory order from {row['status']} to {status}."
+            )
+        if status == "completed" and not (result and result.strip()):
+            raise ValueError("A result is required to complete a laboratory order.")
         old = dict(row)
         now = datetime.now(timezone.utc).isoformat()
         if result is not None:
             conn.execute(
                 "UPDATE laboratory_orders SET status = ?, result = ?, updated_at = ? WHERE id = ?",
-                (status, result, now, order_id),
+                (status, result.strip(), now, order_id),
             )
             _audit(conn, "update", "laboratory_orders", order_id, old,
-                   {"status": status, "result": result})
+                   {"status": status, "result": result.strip()})
         else:
             conn.execute(
                 "UPDATE laboratory_orders SET status = ?, updated_at = ? WHERE id = ?",
@@ -744,119 +820,31 @@ def update_laboratory_order_status(order_id: str, status: str,
 
 
 # ---------------------------------------------------------------------------
-# SOAP note parsing — extract medications and lab tests
-# ---------------------------------------------------------------------------
-_COMMON_MEDICATIONS = [
-    "paracetamol", "acetaminophen", "ibuprofen", "aspirin", "atorvastatin",
-    "amlodipine", "lisinopril", "metformin", "omeprazole", "esomeprazole",
-    "metoprolol", "losartan", "warfarin", "insulin", "prednisone",
-    "azithromycin", "amoxicillin", "ciprofloxacin", "ranitidine",
-    "diazepam", "loratadine", "cetirizine", "montelukast", "albuterol",
-    "salbutamol", "digoxin", "furosemide", "hydrochlorothiazide",
-]
-
-_LAB_TEST_PATTERNS = [
-    "cbc", "complete blood count", "blood test", "blood work",
-    "lipid panel", "cholesterol", "glucose", "blood sugar",
-    "urine test", "urinalysis", "x-ray", "mri", "ct scan",
-    "electrocardiogram", "ecg", "ekg", "thyroid", "tsh",
-    "liver function", "kidney function", "creatinine",
-    "sodium", "potassium", "hemoglobin", "hematocrit",
-    "prothrombin", "inr", "hba1c",
-]
-
-
-def _extract_medication_from_text(text: str):
-    import re
-    text_lower = text.lower()
-    medication = None
-    for med in _COMMON_MEDICATIONS:
-        if med in text_lower:
-            medication = med
-            break
-
-    if not medication:
-        m = re.search(r'\b([A-Z][a-z]{3,})\s+(\d+(?:\.\d+)?\s*(?:mg|g|ml|mcg|units?))\b', text)
-        if m:
-            medication = m.group(1).lower()
-        else:
-            return None
-
-    dosage_match = re.search(r'(\d+(?:\.\d+)?\s*(?:mg|g|ml|mcg|units?))', text, re.IGNORECASE)
-    dosage = dosage_match.group(1) if dosage_match else ""
-
-    frequency = ""
-    freq_patterns = [
-        r'every\s+\d+\s+hours?', r'once\s+daily', r'twice\s+daily',
-        r'three times\s+daily', r'four times\s+daily', r'daily',
-        r'bd', r'tds', r'qid', r'qd', r'prn', r'as\s+needed'
-    ]
-    for pat in freq_patterns:
-        fm = re.search(pat, text, re.IGNORECASE)
-        if fm:
-            frequency = fm.group(0)
-            break
-
-    duration = ""
-    dur_patterns = [
-        r'for\s+\d+\s+days?', r'for\s+\d+\s+weeks?',
-        r'for\s+\d+\s+months?', r'for\s+\d+\s+years?'
-    ]
-    for pat in dur_patterns:
-        dm = re.search(pat, text, re.IGNORECASE)
-        if dm:
-            duration = dm.group(0)
-            break
-
-    return {
-        "medication": medication,
-        "dosage": dosage,
-        "frequency": frequency,
-        "duration": duration,
-        "instructions": text,
-    }
-
-
-def extract_medications_from_plan(plan_items: List[str]) -> List[dict]:
-    medications = []
-    for item in plan_items:
-        extracted = _extract_medication_from_text(item)
-        if extracted:
-            medications.append(extracted)
-    return medications
-
-
-def extract_lab_tests_from_soap(objective_items: List[str],
-                                 plan_items: List[str]) -> List[dict]:
-    import re
-    tests = []
-    all_items = list(objective_items) + list(plan_items)
-    seen = set()
-    for item in all_items:
-        item_lower = item.lower()
-        for pattern in _LAB_TEST_PATTERNS:
-            if pattern in item_lower and pattern not in seen:
-                seen.add(pattern)
-                tests.append({
-                    "test_name": pattern.title(),
-                    "test_code": "",
-                    "specimen": "",
-                    "source_text": item,
-                })
-                break
-    return tests
-
-
-# ---------------------------------------------------------------------------
 # Submit SOAP note — auto-creates pharmacy + lab orders
 # ---------------------------------------------------------------------------
 def submit_soap_note(consultation_id: str, note: Dict[str, Any],
                      engine: str = "rule_based",
-                     auto_route: bool = True) -> Dict[str, Any]:
+                     auto_route: bool = False) -> Dict[str, Any]:
     consultation = get_consultation(consultation_id)
     if not consultation:
         raise ValueError(f"Consultation {consultation_id} not found")
     patient_id = consultation["patient_id"]
+
+    if auto_route:
+        conn = get_conn()
+        try:
+            existing_orders = conn.execute(
+                """SELECT
+                       (SELECT COUNT(*) FROM pharmacy_orders WHERE consultation_id = ?) +
+                       (SELECT COUNT(*) FROM laboratory_orders WHERE consultation_id = ?)""",
+                (consultation_id, consultation_id),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        if existing_orders:
+            raise OrdersAlreadyRoutedError(
+                "Draft orders already exist for this consultation; review them in the queue instead of submitting again."
+            )
 
     note_id = save_soap_note(consultation_id, note, engine=engine)
 

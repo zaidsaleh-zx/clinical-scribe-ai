@@ -21,11 +21,25 @@ reflect that. Frame it this way in your report/viva: it's solving a *time* probl
 
 ## Security and deployment defaults
 
-- Set a strong `CLINICAL_SCRIBE_API_KEY` in `backend/.env` if you expose the service beyond a
-  single local machine. The backend checks the `X-API-Key` header on protected endpoints.
-- Use `CORS_ORIGINS` in `backend/.env` to restrict browser origins when hosting remotely.
-- Start with the included `Dockerfile` for a simpler deployment setup.
-- A `.githooks/pre-commit` scanner blocks obvious API keys before they are committed.
+- **Prototype only:** do not use real patient information. SQLite is not encrypted at rest,
+  this project is not a validated clinical system, and no regulatory or clinical safety
+  certification is implied.
+- Set a unique `CLINICAL_SCRIBE_API_KEY` (at least 16 characters) before exposing the app.
+  The browser signs in for an eight-hour, signed, `HttpOnly`, `SameSite=Strict` session;
+  protected API routes and live-audio WebSockets require authentication. Production-mode
+  startup fails if the key is missing or too short.
+- Keep the dashboard and API on one origin where possible. `CORS_ORIGINS` accepts explicit
+  trusted origins only; wildcard entries are ignored. Use HTTPS for deployed sessions.
+- LLM mode sends the full transcript to the selected external LLM provider. Review that
+  provider's data terms before sending any sensitive content.
+- Saved sessions stay in SQLite until deleted. Use each history item's **Delete** action to
+  remove the visit, note, linked draft orders, and associated audit entries. This does not
+  erase external backups or data already sent to an LLM; configure storage and backup
+  retention separately.
+- Enable the local secret-scanning hook with
+  `git config core.hooksPath .githooks`; never commit `.env` files.
+- The included Docker image installs only the text-mode dependencies by default. Optional
+  build args install audio or LLM packages when needed.
 
 ---
 
@@ -61,8 +75,21 @@ reflect that. Frame it this way in your report/viva: it's solving a *time* probl
 | **Demo Mode** | One click: loads sample patient info + transcript, runs the pipeline animation, generates the note — the "microphone isn't working, no problem" fallback for presentations |
 | **Session history sidebar** | SQLite-backed; saved consultations are listed and clickable to reload |
 | **PDF export** | A clean, printable SOAP note document with patient info and review flags |
+| **Structured JSON export** | Versioned machine-readable SOAP JSON (not a FHIR implementation) |
+| **Clinician-reviewed order suggestions** | Medication/lab suggestions are shown for explicit confirmation before draft queue entries are created |
+| **Undo / redo** | Restore earlier SOAP edits without rerunning generation |
 | **Copy SOAP** | One click copies a plain-text note (with a manual-copy fallback if the Clipboard API is blocked) |
 | **Dark / light mode** | Toggle in the header; dark theme stays teal-tinted rather than generic black, so the brand stays consistent |
+
+**Order workflow:** text extraction only proposes candidates. Review the displayed medicine
+and test details and confirm before the app creates draft queue entries. The extractor is
+not a prescribing system, may miss items, and may suggest the wrong item; it does not check
+allergies, interactions, or clinical appropriateness.
+
+The **Laboratory Dashboard** lists draft test requests and lets an operator enter an
+available result to mark one completed, or cancel a pending request. It does not place a
+real lab order, perform a test, interpret a result, or verify clinical accuracy. Completed
+and cancelled entries are locked from further status changes.
 
 ### Real bugs found and fixed while building this (good material for your report)
 
@@ -159,6 +186,10 @@ clinical-scribe-ai/
 ├── sample_data/
 │   └── sample_consultation.txt   # example transcript for Demo Mode
 ├── requirements.txt
+├── requirements-audio.txt
+├── requirements-llm.txt
+├── requirements-diarization.txt
+├── tests/                 # deterministic synthetic unit and API tests
 └── README.md
 ```
 
@@ -259,7 +290,9 @@ The deployment settings are already prepared in `render.yaml`. Add an
 `ANTHROPIC_API_KEY` or `OPENROUTER_API_KEY` in Render's environment settings if
 you want Claude-assisted notes; rule-based notes work without either key. The
 default SQLite session history is local to the running service and may reset when
-the host redeploys or restarts.
+the host redeploys or restarts. Add a unique `CLINICAL_SCRIBE_API_KEY` secret in
+Render before the service starts; production mode will refuse to start without it.
+Do not treat the hosted prototype as suitable for patient data.
 
 Vercel deployment is also supported for the HTTP/FastAPI routes through
 `api/index.py`. Vercel's serverless runtime does not provide the persistent
@@ -270,8 +303,19 @@ live Whisper workflow.
 ```bash
 pip install -r requirements.txt
 ```
-(`faster-whisper` and `anthropic` are optional — only needed for Live Audio mode / LLM mode
-respectively. Text mode works with just the first four packages.)
+
+This installs the lightweight text-mode app. Add optional packages only for features you
+intend to use:
+
+```bash
+pip install -r requirements-audio.txt       # Live Audio / optional LiveKit transport
+pip install -r requirements-llm.txt          # Anthropic or OpenRouter-backed LLM mode
+pip install -r requirements-diarization.txt  # pyannote, PyTorch, and torchaudio
+```
+
+`backend/requirements.txt` combines the core, audio, and LLM groups for a full Render
+deployment. The `Dockerfile` is core-only by default; enable optional groups with
+`--build-arg INSTALL_AUDIO=true` and/or `--build-arg INSTALL_LLM=true`.
 
 ### Run
 ```bash
@@ -281,14 +325,20 @@ uvicorn backend.main:app --reload --port 8000
 Open **http://localhost:8000** — the backend serves the frontend directly, so this is the
 only thing you need to run.
 
+**To protect a remote deployment**, create `backend/.env`, set a unique
+`CLINICAL_SCRIBE_API_KEY` (at least 16 characters), and keep `APP_ENV=development` locally.
+The browser will prompt for the key at sign-in; the key is held only in page memory when
+needed and is not saved in browser storage. Open the dashboard through the backend URL
+(not by opening the HTML file directly) to use the secure session cookie and live audio.
+
 **To use LLM-assisted notes**, create a `.env` file so you don't have to re-type your key
 every time you open a new terminal:
 
-```bash
-cd backend
-cp ../.env.example .env
+```powershell
+Copy-Item backend\.env.example backend\.env
 ```
-Open `.env` in any text editor and fill in your key:
+Run that PowerShell command from the project root. Open `backend\.env` and fill in
+`CLINICAL_SCRIBE_API_KEY` plus the provider key you intend to use:
 ```
 OPENROUTER_API_KEY=sk-or-your-real-key-here
 ```
@@ -296,8 +346,8 @@ OPENROUTER_API_KEY=sk-or-your-real-key-here
 other one blank). Save the file, then just run `uvicorn backend.main:app --reload --port 8000` as
 normal — it loads `.env` automatically on startup, no `export` needed.
 
-`.env` is already in `.gitignore`, so it's never at risk of being committed — only
-`.env.example` (with blank values) is meant to be shared or pushed to a repo.
+`.env` is already in `.gitignore`, so it is not meant to be committed; only `.env.example`
+files with blank values should be shared.
 
 Then tick "Use Claude LLM" in the UI. The header's status chips will show green/on once the
 backend picks up the key — refresh the page if you started the backend after the page was
@@ -312,7 +362,7 @@ starting uvicorn works too — it just needs to be re-run every time you open a 
 3. Watch the transcript populate on the left and the structured note build on the right
 
 ### Try it (Live Audio mode — needs setup)
-1. `pip install faster-whisper` (first transcription downloads the model — needs internet)
+1. `pip install -r requirements-audio.txt` (first transcription downloads the model — needs internet)
 2. Switch to the **"Live Audio"** tab
 3. Click **"Start Recording"**, allow mic access, and talk through a mock consultation
 4. Watch the transcript and note build in real time
@@ -321,6 +371,10 @@ starting uvicorn works too — it just needs to be re-run every time you open a 
 
 ## 7. Known Limitations & Honest Notes (good material for your report/viva)
 
+- **This is not for real patient data.** Storage is unencrypted SQLite, the single shared key
+  does not provide user-specific authorization, and LLM mode transmits the transcript to an
+  external provider. Session deletion cannot erase provider-side or separately managed
+  backups. The auth and deletion controls are prototype safeguards, not regulatory compliance.
 - **Rule-based classification isn't perfect.** During development, several real bugs came
   up and got fixed — e.g., `"500mg"` wasn't matching the `mg` dosage pattern because of a
   regex word-boundary issue (digits and letters are both "word characters," so there's no
@@ -363,10 +417,25 @@ starting uvicorn works too — it just needs to be re-run every time you open a 
 
 ## 9. Good Stretch Goals (still open)
 - **ICD-10 code suggestion** based on the Assessment section
-- **A real evaluation set** of de-identified consultation transcripts to measure rule-based
-  vs. LLM-assisted accuracy quantitatively — strong material for a results section
-- **Multi-user auth** if this ever needed to handle more than one clinician's sessions
+- **Calibrated uncertainty reporting.** Current source highlighting is traceability, not
+  confidence. Do not show numeric confidence until it has been calibrated and evaluated
+  against clinician-reviewed examples.
+- **A reviewed evaluation set** of synthetic or appropriately de-identified consultations
+  to measure section-level precision/recall and note omissions for each engine.
+- **Multi-user auth** if this ever needed to handle more than one clinician; the current
+  shared key is a single-admin prototype gate, not user accounts or per-user data isolation.
 - **Richer patient records** — the current session history is a flat list; a real system
   would link multiple visits to one patient profile over time
-- A small evaluation set of real (de-identified) consultation transcripts to measure
-  rule-based vs. LLM-assisted accuracy — genuinely good material for a results section
+
+## 10. Run tests and keep deployments in sync
+
+```bash
+pip install -r requirements-dev.txt
+python -m unittest discover -s tests -v
+ruff check --select E4,E7,E9,F --ignore E402 backend/auth.py backend/order_routing.py backend/models.py tests
+python scripts/sync_hf_space.py
+```
+
+`backend/` and `frontend/` are the canonical application sources. After changing shared
+files, run `python scripts/sync_hf_space.py --sync`; CI checks that the Hugging Face Space
+copy has not drifted.

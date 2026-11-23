@@ -15,3 +15,9 @@ services:
         sync: false
       - key: LIVEKIT_API_SECRET
         sync: false
+      - key: APP_ENV
+        value: production
+      - key: SESSION_COOKIE_SECURE
+        value: "true"
+      - key: CLINICAL_SCRIBE_API_KEY
+        sync: false

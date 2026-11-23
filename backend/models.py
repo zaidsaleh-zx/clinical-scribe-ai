@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Literal
 
 # Upper bound on transcript size accepted by the API. A student-project safeguard:
 # without this, a very large paste can make the rule-based regex passes slow and can
@@ -53,14 +53,21 @@ class SessionState(BaseModel):
 class SubmitSessionRequest(BaseModel):
     consultation_id: str
     note: dict
-    patient: PatientInfo = PatientInfo()
-    auto_route: bool = True
+    confirm_order_routing: bool = False
+
+
+class LoginRequest(BaseModel):
+    api_key: str = Field(..., min_length=1, max_length=512)
+
+
+class OrderPreviewRequest(BaseModel):
+    note: dict
 
 
 class PharmacyOrderStatusRequest(BaseModel):
-    status: str  # pending | dispensed | cancelled
+    status: Literal["pending", "dispensed", "cancelled"]
 
 
 class LaboratoryOrderStatusRequest(BaseModel):
-    status: str  # pending | completed | cancelled
-    result: Optional[str] = None
+    status: Literal["completed", "cancelled"]
+    result: Optional[str] = Field(default=None, max_length=4000)

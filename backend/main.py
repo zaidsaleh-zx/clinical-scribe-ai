@@ -19,6 +19,7 @@ Then open http://localhost:8000 — the backend serves the frontend directly.
 import os
 import logging
 import asyncio
+import hmac
 import re
 import string
 import time
@@ -27,7 +28,8 @@ from collections import defaultdict, deque
 from datetime import timedelta
 from typing import Optional
 from dotenv import load_dotenv
-load_dotenv()  # loads variables from a local .env file, if one exists (see .env.example)
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BACKEND_DIR, ".env"))
 
 import json
 import uuid
@@ -39,10 +41,16 @@ from fastapi.responses import FileResponse, Response
 from .models import (
     TranscriptRequest, SoapNoteResponse, SaveSessionRequest, ExportPdfRequest,
     SubmitSessionRequest, PharmacyOrderStatusRequest, LaboratoryOrderStatusRequest,
+    LoginRequest, OrderPreviewRequest,
+)
+from .auth import (
+    SESSION_COOKIE_NAME, SESSION_TTL_SECONDS, create_session_token,
+    is_valid_session_token,
 )
 from .soap_generator import generate_soap
 from . import db
 from .pdf_export import generate_pdf
+from .order_routing import preview_orders
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("clinical-scribe")
@@ -116,10 +124,8 @@ def _normalize_for_dedup(text: str) -> str:
 
 app = FastAPI(title="Clinical Documentation Assistant")
 
-BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_DIR = os.path.realpath(os.path.join(BACKEND_DIR, "..", "frontend"))
 SAMPLE_DATA_DIR = os.path.realpath(os.path.join(BACKEND_DIR, "..", "sample_data"))
-load_dotenv(os.path.join(BACKEND_DIR, ".env"))
 
 # A tiny, self-contained security layer: when a real API key is configured, protect
 # the writeable or patient-sensitive routes while leaving the public health/status
@@ -129,10 +135,8 @@ PUBLIC_PATHS = {
     "/api/health",
     "/api/status",
     "/api/sample-transcript",
-    "/docs",
-    "/openapi.json",
-    "/redoc",
-    "/ws/session",
+    "/api/auth/status",
+    "/api/auth/login",
 }
 REQUEST_BUCKETS = defaultdict(deque)
 
@@ -149,10 +153,30 @@ def _require_api_key() -> bool:
     return _get_configured_api_key() is not None
 
 
-def _skip_auth(path: str) -> bool:
-    if path in PUBLIC_PATHS:
+def _is_authenticated(request: Request) -> bool:
+    expected = _get_configured_api_key()
+    if expected is None:
         return True
-    return path.startswith("/static/") or path.startswith("/assets/")
+
+    provided = request.headers.get("x-api-key")
+    authorization = request.headers.get("authorization", "")
+    if provided is None and authorization.lower().startswith("bearer "):
+        provided = authorization[7:].strip()
+    if provided is not None and hmac.compare_digest(
+        provided.encode("utf-8"),
+        expected.encode("utf-8"),
+    ):
+        return True
+    return is_valid_session_token(expected, request.cookies.get(SESSION_COOKIE_NAME))
+
+
+def _is_trusted_origin(origin: str, request: Request) -> bool:
+    if origin == "null":
+        return origin in CORS_ORIGINS
+    allowed = set(CORS_ORIGINS)
+    host = request.headers.get("host", "")
+    allowed.update({f"http://{host}", f"https://{host}"})
+    return origin.rstrip("/") in {value.rstrip("/") for value in allowed}
 
 
 @app.middleware("http")
@@ -161,15 +185,41 @@ async def security_middleware(request: Request, call_next):
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    if _require_api_key() and not _skip_auth(path):
-        expected = _get_configured_api_key()
-        provided = request.headers.get("x-api-key") or request.headers.get("authorization", "").replace("Bearer ", "", 1).strip()
-        if not expected or provided != expected:
+    if path.startswith("/api/") and path not in PUBLIC_PATHS and _require_api_key():
+        if not _is_authenticated(request):
             return Response(
                 status_code=401,
-                content=json.dumps({"error": "Unauthorized: provide a valid X-API-Key header."}),
+                content=json.dumps({"error": "Authentication required."}),
                 media_type="application/json",
             )
+
+        if (
+            request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            and request.cookies.get(SESSION_COOKIE_NAME)
+            and not request.headers.get("x-api-key")
+            and not request.headers.get("authorization")
+        ):
+            origin = request.headers.get("origin")
+            if not origin or not _is_trusted_origin(origin, request):
+                return Response(
+                    status_code=403,
+                    content=json.dumps({"error": "Untrusted request origin."}),
+                    media_type="application/json",
+                )
+
+    if path == "/api/auth/login":
+        client_ip = request.client.host if request.client else "anonymous"
+        now = time.monotonic()
+        bucket = REQUEST_BUCKETS[f"login:{client_ip}"]
+        while bucket and now - bucket[0] > 60:
+            bucket.popleft()
+        if len(bucket) >= 5:
+            return Response(
+                status_code=429,
+                content=json.dumps({"error": "Too many login attempts. Please wait a minute."}),
+                media_type="application/json",
+            )
+        bucket.append(now)
 
     if path.startswith("/api/generate-note") or path.startswith("/api/export-pdf"):
         client_ip = request.client.host if request.client else "anonymous"
@@ -200,22 +250,28 @@ def validate_runtime_config() -> None:
     api_key = _get_configured_api_key()
     if api_key and len(api_key) < 16:
         warnings.append("CLINICAL_SCRIBE_API_KEY is set but looks unusually short")
+    if os.environ.get("APP_ENV", "").lower() == "production" and not api_key:
+        raise RuntimeError("CLINICAL_SCRIBE_API_KEY is required when APP_ENV=production")
+    if os.environ.get("APP_ENV", "").lower() == "production" and api_key and len(api_key) < 16:
+        raise RuntimeError("CLINICAL_SCRIBE_API_KEY must contain at least 16 characters in production")
     for message in warnings:
         logger.warning(message)
 
 
-# CORS must allow every origin the frontend actually runs from:
-#   * the backend itself (http://localhost:8000),
-#   * a remote/Vercel origin when configured via CORS_ORIGINS (comma-separated)
-#     in backend/.env, and
-#   * "null", the Origin a browser sends for a page opened directly from disk
-#     (file://) — without it the status/history/PDF fetches are blocked.
+# CORS allows the local app and explicitly configured browser origins. Serve the
+# frontend from this backend when possible instead of allowing opaque file origins.
 # Built AFTER load_dotenv so a CORS_ORIGINS entry in backend/.env is honored.
+_configured_cors_origins = [
+    o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()
+]
+if "*" in _configured_cors_origins:
+    logger.warning("Ignoring wildcard CORS_ORIGINS; configure explicit browser origins instead")
+_configured_cors_origins = [origin for origin in _configured_cors_origins if origin != "*"]
+
 CORS_ORIGINS = [
     "http://localhost:8000",
     "http://127.0.0.1:8000",
-    "null",
-] + [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
+] + _configured_cors_origins
 
 app.add_middleware(
     CORSMiddleware,
@@ -229,6 +285,45 @@ app.add_middleware(
 @app.on_event("startup")
 def startup_validation():
     validate_runtime_config()
+
+
+@app.get("/api/auth/status")
+def auth_status(request: Request):
+    return {
+        "auth_required": _require_api_key(),
+        "authenticated": _is_authenticated(request),
+    }
+
+
+@app.post("/api/auth/login")
+def auth_login(req: LoginRequest, request: Request):
+    expected = _get_configured_api_key()
+    if expected is None:
+        return Response(status_code=503, content='{"error":"Authentication is not configured."}', media_type="application/json")
+    if not hmac.compare_digest(req.api_key.strip().encode("utf-8"), expected.encode("utf-8")):
+        return Response(status_code=401, content='{"error":"Invalid access key."}', media_type="application/json")
+
+    response = Response(content='{"authenticated":true}', media_type="application/json")
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        create_session_token(expected),
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=(
+            os.environ.get("SESSION_COOKIE_SECURE", "").lower() == "true"
+            or request.url.scheme == "https"
+        ),
+        samesite="strict",
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/auth/logout")
+def auth_logout():
+    response = Response(content='{"authenticated":false}', media_type="application/json")
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/", httponly=True, samesite="strict")
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +424,21 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/api/export-json")
+def export_json(req: ExportPdfRequest):
+    """Download a versioned, machine-readable SOAP representation (not a FHIR claim)."""
+    export = {
+        "schema": "clinicalscribe.soap-note.v1",
+        "patient": req.patient.model_dump(),
+        "note": req.note,
+    }
+    return Response(
+        content=json.dumps(export, ensure_ascii=False, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": 'attachment; filename="clinicalscribe-note.json"'},
+    )
+
+
 # ---------------------------------------------------------------------------
 # SESSION HISTORY — lightweight SQLite-backed "recent consultations"
 # ---------------------------------------------------------------------------
@@ -359,21 +469,34 @@ def get_session(session_id: str):
     return session
 
 
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: str):
+    if not db.delete_session(session_id):
+        return Response(status_code=404, content='{"error":"not found"}', media_type="application/json")
+    return {"deleted": True, "session_id": session_id}
+
+
 # ---------------------------------------------------------------------------
-# SUBMIT SOAP NOTE — auto-routes to pharmacy & laboratory
+# SUBMIT SOAP NOTE — order creation is opt-in after clinician review
 # ---------------------------------------------------------------------------
+@app.post("/api/orders/preview")
+def order_preview(req: OrderPreviewRequest):
+    return preview_orders(req.note)
+
+
 @app.post("/api/sessions/submit")
 def submit_session(req: SubmitSessionRequest):
-    """Save a SOAP note and automatically create pharmacy + laboratory orders
-    from the extracted medications and lab tests."""
+    """Save a SOAP note; route suggested orders only after explicit confirmation."""
     try:
         result = db.submit_soap_note(
             consultation_id=req.consultation_id,
             note=req.note,
             engine=req.note.get("engine", "rule_based"),
-            auto_route=req.auto_route,
+            auto_route=req.confirm_order_routing,
         )
         return result
+    except db.OrdersAlreadyRoutedError as e:
+        return Response(status_code=409, content=json.dumps({"error": str(e)}), media_type="application/json")
     except ValueError as e:
         return Response(status_code=404, content=json.dumps({"error": str(e)}), media_type="application/json")
 
@@ -388,7 +511,10 @@ def list_pharmacy_orders(consultation_id: Optional[str] = None, status: Optional
 
 @app.post("/api/pharmacy/orders/{order_id}/status")
 def update_pharmacy_order_status(order_id: str, req: PharmacyOrderStatusRequest):
-    ok = db.update_pharmacy_order_status(order_id, req.status)
+    try:
+        ok = db.update_pharmacy_order_status(order_id, req.status)
+    except db.InvalidPharmacyOrderTransitionError as e:
+        return Response(status_code=409, content=json.dumps({"error": str(e)}), media_type="application/json")
     if not ok:
         return Response(status_code=404, content=json.dumps({"error": "not found"}), media_type="application/json")
     return {"order_id": order_id, "status": req.status}
@@ -404,7 +530,16 @@ def list_laboratory_orders(consultation_id: Optional[str] = None, status: Option
 
 @app.post("/api/lab/orders/{order_id}/status")
 def update_laboratory_order_status(order_id: str, req: LaboratoryOrderStatusRequest):
-    ok = db.update_laboratory_order_status(order_id, req.status, req.result)
+    if req.status == "completed" and not (req.result and req.result.strip()):
+        return Response(
+            status_code=422,
+            content=json.dumps({"error": "A result is required to complete a laboratory order."}),
+            media_type="application/json",
+        )
+    try:
+        ok = db.update_laboratory_order_status(order_id, req.status, req.result)
+    except db.InvalidLaboratoryOrderTransitionError as e:
+        return Response(status_code=409, content=json.dumps({"error": str(e)}), media_type="application/json")
     if not ok:
         return Response(status_code=404, content=json.dumps({"error": "not found"}), media_type="application/json")
     return {"order_id": order_id, "status": req.status, "result": req.result}
@@ -665,6 +800,19 @@ async def _transcribe_and_emit(session, websocket, wav_blob) -> str:
 
 @app.websocket("/ws/session")
 async def live_session(websocket: WebSocket):
+    expected = _get_configured_api_key()
+    if expected:
+        token = websocket.cookies.get(SESSION_COOKIE_NAME)
+        if not is_valid_session_token(expected, token):
+            await websocket.close(code=1008, reason="Authentication required")
+            return
+        origin = websocket.headers.get("origin")
+        allowed_origins = set(CORS_ORIGINS)
+        host = websocket.headers.get("host", "")
+        allowed_origins.update({f"http://{host}", f"https://{host}"})
+        if not origin or origin.rstrip("/") not in {value.rstrip("/") for value in allowed_origins}:
+            await websocket.close(code=1008, reason="Untrusted request origin")
+            return
     await websocket.accept()
     session = LiveSession()
     livekit_bridge = None

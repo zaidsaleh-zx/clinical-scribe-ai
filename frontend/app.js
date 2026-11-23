@@ -2,6 +2,34 @@
 const API_BASE = window.location.protocol === "file:" ? "http://127.0.0.1:8000" : "";
 let currentNote = { subjective: [], objective: [], assessment: [], plan: [], unclassified: [] };
 let currentTranscript = "";
+const undoNoteStack = [];
+const redoNoteStack = [];
+
+function cloneNote(note) {
+  return JSON.parse(JSON.stringify(note));
+}
+
+function updateEditHistoryButtons() {
+  document.getElementById("undoEditBtn").disabled = undoNoteStack.length === 0;
+  document.getElementById("redoEditBtn").disabled = redoNoteStack.length === 0;
+}
+
+function resetEditHistory() {
+  undoNoteStack.length = 0;
+  redoNoteStack.length = 0;
+  updateEditHistoryButtons();
+}
+
+function applyEditHistory(source, destination) {
+  if (!source.length) return;
+  destination.push(cloneNote(currentNote));
+  currentNote = source.pop();
+  renderNote(currentNote);
+  updateEditHistoryButtons();
+}
+
+document.getElementById("undoEditBtn").addEventListener("click", () => applyEditHistory(undoNoteStack, redoNoteStack));
+document.getElementById("redoEditBtn").addEventListener("click", () => applyEditHistory(redoNoteStack, undoNoteStack));
 
 // ================= THEME =================
 const themeToggle = document.getElementById("themeToggle");
@@ -28,7 +56,7 @@ themeToggle.addEventListener("click", () => {
 // ================= SYSTEM STATUS =================
 async function loadStatus() {
   try {
-    const res = await fetch(`${API_BASE}/api/status`);
+    const res = await apiFetch(`${API_BASE}/api/status`);
     const data = await res.json();
     const whisperChip = document.getElementById("chipWhisper");
     const llmChip = document.getElementById("chipLlm");
@@ -150,6 +178,7 @@ function renderNote(note) {
 
   renderCompleteness(note.completeness || {});
   renderReviewItems(note.issues || []);
+  updateEditHistoryButtons();
 }
 
 function focusTranscriptLine(lineIndex) {
@@ -320,23 +349,7 @@ function toggleEditSection(section) {
   const existingTextarea = sectionEl ? sectionEl.querySelector(".soap-edit-area") : null;
 
   if (existingTextarea) {
-    const lines = existingTextarea.value.split("\n").map(l => l.trim()).filter(Boolean);
-    currentNote[section] = lines;
-    if (currentNote.sources) currentNote.sources[section] = [];
-
-    // Restore the <ul> element renderNote() expects — it was replaced by the
-    // textarea when edit mode was entered, and renderNote() looks it up by ID.
-    const newList = document.createElement("ul");
-    newList.className = "soap-list";
-    newList.id = `${section}List`;
-    const hint = sectionEl.querySelector(".soap-edit-hint");
-    if (hint) hint.remove();
-    existingTextarea.replaceWith(newList);
-
-    const btn = document.querySelector(`.edit-btn[data-edit="${section}"]`);
-    if (btn) btn.textContent = "Edit";
-
-    renderNote(currentNote);
+    saveEditedSection(section, existingTextarea, sectionEl);
     return;
   }
 
@@ -356,34 +369,25 @@ function toggleEditSection(section) {
   const btn = document.querySelector(`.edit-btn[data-edit="${section}"]`);
   if (btn) btn.textContent = "Save";
 
-  const saveHandler = () => {
-    const lines = textarea.value.split("\n").map(l => l.trim()).filter(Boolean);
+  btn.textContent = "Save";
+}
+
+function saveEditedSection(section, textarea, sectionEl) {
+  const lines = textarea.value.split("\n").map(line => line.trim()).filter(Boolean);
+  if (JSON.stringify(lines) !== JSON.stringify(currentNote[section] || [])) {
+    undoNoteStack.push(cloneNote(currentNote));
+    redoNoteStack.length = 0;
     currentNote[section] = lines;
     if (currentNote.sources) currentNote.sources[section] = [];
-
-    // Restore the <ul> element renderNote() expects — it was replaced by the
-    // textarea when edit mode was entered, and renderNote() looks it up by ID.
-    const newList = document.createElement("ul");
-    newList.className = "soap-list";
-    newList.id = `${section}List`;
-    hint.remove();
-    textarea.replaceWith(newList);
-
-    const freshBtn = document.querySelector(`.edit-btn[data-edit="${section}"]`);
-    if (freshBtn) {
-      freshBtn.textContent = "Edit";
-      freshBtn.removeEventListener("click", saveHandler);
-      freshBtn.addEventListener("click", () => toggleEditSection(section));
-    }
-
-    renderNote(currentNote);
-  };
-  btn.replaceWith(btn.cloneNode(true)); // strip old listener cleanly
-  const freshBtn = document.querySelector(`.edit-btn[data-edit="${section}"]`);
-  if (freshBtn) {
-    freshBtn.textContent = "Save";
-    freshBtn.addEventListener("click", saveHandler, { once: true });
   }
+  const newList = document.createElement("ul");
+  newList.className = "soap-list";
+  newList.id = `${section}List`;
+  sectionEl.querySelector(".soap-edit-hint")?.remove();
+  textarea.replaceWith(newList);
+  const button = document.querySelector(`.edit-btn[data-edit="${section}"]`);
+  if (button) button.textContent = "Edit";
+  renderNote(currentNote);
 }
 
 // ================= TEXT MODE =================
@@ -393,18 +397,19 @@ const transcriptInput = document.getElementById("transcriptInput");
 const useLlmToggle = document.getElementById("useLlmToggle");
 
 async function fetchSampleTranscript() {
-  const res = await fetch(`${API_BASE}/api/sample-transcript`);
+  const res = await apiFetch(`${API_BASE}/api/sample-transcript`);
   const data = await res.json();
   return data.transcript;
 }
 
 async function runGeneration(transcript) {
+  resetEditHistory();
   clearTranscript();
   currentTranscript = transcript;
   transcript.split("\n").filter(l => l.trim()).forEach((line, index) => renderTranscriptLine(line, index));
 
   const note = await animatePipelineThenRun(async () => {
-    const res = await fetch(`${API_BASE}/api/generate-note`, {
+    const res = await apiFetch(`${API_BASE}/api/generate-note`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ transcript, use_llm: useLlmToggle.checked }),
@@ -486,7 +491,7 @@ function fallbackCopy(text, onSuccess) {
 document.getElementById("exportPdfBtn").addEventListener("click", async () => {
   const patient = getPatientInfo();
   try {
-    const res = await fetch(`${API_BASE}/api/export-pdf`, {
+    const res = await apiFetch(`${API_BASE}/api/export-pdf`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ note: currentNote, patient }),
@@ -504,10 +509,87 @@ document.getElementById("exportPdfBtn").addEventListener("click", async () => {
   }
 });
 
+document.getElementById("exportJsonBtn").addEventListener("click", async () => {
+  try {
+    const response = await apiFetch(`${API_BASE}/api/export-json`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note: currentNote, patient: getPatientInfo() }),
+    });
+    if (!response.ok) throw new Error("JSON export failed.");
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "clinicalscribe-note.json";
+    link.click();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    alert(`JSON export failed: ${error.message}`);
+  }
+});
+
+document.getElementById("reviewOrdersBtn").addEventListener("click", async () => {
+  const button = document.getElementById("reviewOrdersBtn");
+  button.disabled = true;
+  try {
+    const previewResponse = await apiFetch(`${API_BASE}/api/orders/preview`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note: currentNote }),
+    });
+    if (!previewResponse.ok) throw new Error("Could not prepare order suggestions.");
+    const preview = await previewResponse.json();
+    const medications = preview.medications || [];
+    const tests = preview.laboratory_tests || [];
+    if (!medications.length && !tests.length) {
+      alert("No medication or laboratory order suggestions were found.");
+      return;
+    }
+
+    const lines = [
+      ...medications.map(item =>
+        `Medication: ${item.medication}; dose: ${item.dosage || "MISSING"}; frequency: ${item.frequency || "MISSING"}; duration: ${item.duration || "MISSING"}`
+      ),
+      ...tests.map(item => `Laboratory test: ${item.test_name}`),
+    ];
+    if (!window.confirm(
+      `Review these machine-extracted suggestions carefully. Missing dose/frequency/duration must be resolved outside this prototype. No order will be created unless you confirm.\n\n${lines.join("\n")}\n\nCreate these draft queue entries?`
+    )) return;
+
+    const saveResponse = await apiFetch(`${API_BASE}/api/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ transcript: currentTranscript, note: currentNote, patient: getPatientInfo() }),
+    });
+    if (!saveResponse.ok) throw new Error("Could not save the reviewed consultation.");
+    const saved = await saveResponse.json();
+    const submitResponse = await apiFetch(`${API_BASE}/api/sessions/submit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        consultation_id: saved.session_id,
+        note: currentNote,
+        confirm_order_routing: true,
+      }),
+    });
+    if (!submitResponse.ok) {
+      const error = await submitResponse.json().catch(() => ({}));
+      throw new Error(error.error || "Could not create the confirmed queue entries.");
+    }
+    const result = await submitResponse.json();
+    await loadHistory();
+    alert(`Confirmed draft queue entries: ${result.pharmacy_order_ids.length} medication(s), ${result.laboratory_order_ids.length} test(s).`);
+  } catch (error) {
+    alert(`Order review failed: ${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
+});
+
 document.getElementById("saveSessionBtn").addEventListener("click", async () => {
   const patient = getPatientInfo();
   try {
-    const res = await fetch(`${API_BASE}/api/sessions`, {
+    const res = await apiFetch(`${API_BASE}/api/sessions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ transcript: currentTranscript, note: currentNote, patient }),
@@ -535,7 +617,7 @@ function getPatientInfo() {
 // ================= SESSION HISTORY SIDEBAR =================
 async function loadHistory() {
   try {
-    const res = await fetch(`${API_BASE}/api/sessions`);
+    const res = await apiFetch(`${API_BASE}/api/sessions`);
     const sessions = await res.json();
     const list = document.getElementById("historyList");
     if (!sessions || sessions.length === 0) {
@@ -557,11 +639,25 @@ async function loadHistory() {
         <div class="history-item" data-id="${s.id}">
           <div class="history-item-name">${escapeHtml(s.patient_name || "Unnamed patient")}</div>
           <div class="history-item-meta">${escapeHtml(s.chief_complaint || "—")} · ${date}</div>
+          <button type="button" class="history-delete-btn" data-delete-id="${escapeHtml(s.id)}" aria-label="Permanently delete saved consultation">Delete</button>
         </div>`;
     }).join("");
 
     list.querySelectorAll(".history-item").forEach(el => {
       el.addEventListener("click", () => loadSessionById(el.dataset.id));
+    });
+    list.querySelectorAll(".history-delete-btn").forEach(button => {
+      button.addEventListener("click", async event => {
+        event.stopPropagation();
+        if (!window.confirm("Permanently delete this saved consultation and its associated note, orders, and audit records?")) return;
+        try {
+          const response = await apiFetch(`${API_BASE}/api/sessions/${encodeURIComponent(button.dataset.deleteId)}`, { method: "DELETE" });
+          if (!response.ok) throw new Error("The consultation could not be deleted.");
+          await loadHistory();
+        } catch (error) {
+          alert(error.message);
+        }
+      });
     });
   } catch (err) {
     console.error("Failed to load history:", err);
@@ -570,7 +666,8 @@ async function loadHistory() {
 
 async function loadSessionById(id) {
   try {
-    const res = await fetch(`${API_BASE}/api/sessions/${id}`);
+    const res = await apiFetch(`${API_BASE}/api/sessions/${id}`);
+    if (!res.ok) throw new Error("Could not load this consultation.");
     const session = await res.json();
     if (session.error) return;
 
@@ -579,6 +676,7 @@ async function loadSessionById(id) {
     document.getElementById("patientGender").value = session.patient_gender || "";
     document.getElementById("chiefComplaint").value = session.chief_complaint || "";
 
+    resetEditHistory();
     switchMode("text");
     transcriptInput.value = session.transcript || "";
     clearTranscript();
@@ -700,6 +798,7 @@ function connectWebSocket() {
       console.error("Backend error:", msg.message);
       setMicStatus("Error: " + msg.message);
     } else if (msg.type === "reset_ack") {
+      resetEditHistory();
       clearTranscript();
       clearNote();
       resetPipeline();
@@ -709,13 +808,17 @@ function connectWebSocket() {
   return new Promise((resolve, reject) => {
     ws.onopen = () => resolve();
     ws.onerror = () => reject(new Error("Could not connect to the live transcription service."));
-    ws.onclose = () => {
+    ws.onclose = (event) => {
+      if (event.code === 1008 && window.clinicalScribeAuth) {
+        window.clinicalScribeAuth.showLogin("Sign in to use live transcription.");
+      }
       setMicStatus("Reconnecting…");
       // If the user is still recording when the socket drops, try once to
       // reconnect instead of silently dropping all further audio.
       if (isRecording) {
         setTimeout(async () => {
           try {
+            if (event.code === 1008) return;
             await connectWebSocket();
             setMicStatus("Reconnected — Listening…");
           } catch (e) {
@@ -981,6 +1084,7 @@ resetSessionBtn.addEventListener("click", () => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "reset" }));
   } else {
+    resetEditHistory();
     clearTranscript();
     clearNote();
     resetPipeline();
@@ -1112,7 +1216,12 @@ function initMedicalCanvas() {
 }
 
 // ================= INIT =================
-loadStatus();
-loadHistory();
-clearNote();
+async function loadApplicationData() {
+  if (!await window.clinicalScribeAuth.initialize()) return;
+  await Promise.all([loadStatus(), loadHistory()]);
+  clearNote();
+}
+
+document.addEventListener("clinical-scribe-authenticated", loadApplicationData);
+loadApplicationData();
 initMedicalCanvas();

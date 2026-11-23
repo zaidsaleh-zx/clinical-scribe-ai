@@ -17,7 +17,7 @@
       --border: #dfeae6;
       --text: #18342d;
       --muted: #56756f;
-      --brand: #059669;
+      --brand: #057e96;
       --brand-deep: #047857;
       --brand-soft: #e8fff7;
       --warning: #f59e0b;
@@ -75,6 +75,10 @@
     .pharmacy-header p {
       margin: 0.5rem 0 0;
       opacity: 0.92;
+    }
+    .pharmacy-header .prototype-note {
+      max-width: 720px;
+      font-weight: 700;
     }
     .top-actions {
       display: flex;
@@ -268,10 +272,11 @@
       <div class="pharmacy-header-row">
         <div>
           <h1>Pharmacy Dashboard</h1>
-          <p>Dispense-ready prescriptions generated from the current SOAP note.</p>
+          <p class="prototype-note">Draft queue entries for demonstration only. Verify every order against the clinician-approved plan; this app does not issue prescriptions.</p>
         </div>
         <div class="top-actions">
           <a class="nav-link" href="/">Back to clinical note</a>
+          <a class="nav-link" href="/lab.html">Laboratory dashboard</a>
           <button class="refresh-btn" id="refreshOrders">Refresh</button>
         </div>
       </div>
@@ -335,6 +340,7 @@
     </section>
   </div>
 
+  <script src="auth.js"></script>
   <script>
     const API_BASE = window.location.protocol === 'file:' ? 'http://127.0.0.1:8000' : '';
     const statusFilter = document.getElementById('statusFilter');
@@ -368,7 +374,7 @@
 
     function statusBadge(status) {
       const normalized = normalizeStatus(status);
-      return `<span class="status-badge status-${normalized || 'pending'}">${normalized || 'pending'}</span>`;
+      return `<span class="status-badge status-${escapeHtml(normalized || 'pending')}">${escapeHtml(normalized || 'pending')}</span>`;
     }
 
     function getVisibleOrders() {
@@ -403,10 +409,10 @@
             <td>${statusBadge(order.status)}</td>
             <td>
               <div class="table-actions">
-                <button class="btn-dispense" data-order-id="${order.id}" ${isPending ? '' : 'disabled'}>
+                <button class="btn-dispense" data-order-id="${escapeHtml(order.id)}" ${isPending ? '' : 'disabled'}>
                   ${isPending ? 'Mark dispensed' : 'Dispensed'}
                 </button>
-                <button class="btn-secondary" data-cancel-id="${order.id}" ${normalizeStatus(order.status) === 'cancelled' ? 'disabled' : ''}>
+                <button class="btn-secondary" data-cancel-id="${escapeHtml(order.id)}" ${isPending ? '' : 'disabled'}>
                   Cancel
                 </button>
               </div>
@@ -425,7 +431,7 @@
 
     async function updateOrderStatus(orderId, status) {
       try {
-        const response = await fetch(`${API_BASE}/api/pharmacy/orders/${orderId}/status`, {
+        const response = await apiFetch(`${API_BASE}/api/pharmacy/orders/${encodeURIComponent(orderId)}/status`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ status })
@@ -442,7 +448,7 @@
 
     async function loadOrders() {
       try {
-        const response = await fetch(`${API_BASE}/api/pharmacy/orders`);
+        const response = await apiFetch(`${API_BASE}/api/pharmacy/orders`);
         if (!response.ok) throw new Error('Unable to load pharmacy orders');
         allOrders = await response.json();
         renderStats(allOrders);
@@ -465,7 +471,10 @@
 
     statusFilter.addEventListener('change', renderTable);
     refreshButton.addEventListener('click', loadOrders);
-    loadOrders();
+    window.clinicalScribeAuth.initialize().then((allowed) => {
+      if (allowed) loadOrders();
+    });
+    document.addEventListener('clinical-scribe-authenticated', loadOrders);
   </script>
 </body>
 </html>

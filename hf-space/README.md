@@ -28,6 +28,21 @@ patient record — the UI deliberately labels every note "DRAFT — review befor
 reflect that. Frame it this way in your report/viva: it's solving a *time* problem
 (paperwork), not a *diagnostic* problem.
 
+## Security and privacy
+
+This Space runs in production mode and requires a `CLINICAL_SCRIBE_API_KEY` secret
+(at least 16 characters) in the Space's Settings → Variables and secrets before it starts.
+The browser uses an eight-hour signed HTTP-only session. Do not enter real patient data:
+SQLite is not encrypted at rest, this is not a validated clinical system, and LLM mode
+sends full transcripts to its configured external provider. Session deletion does not erase
+provider-side data or independent backups.
+
+## Install options
+
+The default Space image installs core and optional LLM dependencies, but not speech models.
+Live Audio and speaker diarization are not enabled in the default image; their optional
+packages are listed in `requirements-audio.txt` and `requirements-diarization.txt`.
+
 ---
 
 ## 1. What It Actually Does
